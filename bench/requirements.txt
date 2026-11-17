@@ -1,0 +1,3 @@
+# ScopeGate bench dependencies (M4 skeleton)
+pytest>=8.0
+

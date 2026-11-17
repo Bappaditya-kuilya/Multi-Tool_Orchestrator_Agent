@@ -1,0 +1,45 @@
+# Example: read-only scope policy (scaffold / illustrative)
+# NOT validated against a finalized runtime schema/loader/enforcement path.
+# Target semantics (aligned with core primitives): deny-by-default; Forbid overrides Permit;
+# risky/tainted actions may become RequireApproval once M2/M6 wiring lands.
+
+version: 1
+name: allow-readonly
+description: Illustrative policy granting read/list-style access while denying mutating actions.
+
+subjects:
+  - id: example-agent
+    roles: ["reader"]
+    # principals/tokens: planned (Biscuit-bound identity)
+
+tools:
+  # Example MCP tool scoping (planned binding)
+  allow:
+    - server: "*"
+      tool: ["read_*", "list_*", "get_*"]
+  deny:
+    - server: "*"
+      tool: ["write_*", "delete_*", "update_*", "exec_*"]
+
+resources:
+  allow:
+    - "docs/*"
+    - "data/public/*"
+  deny:
+    - "*"
+
+conditions:
+  default: deny
+  # Planned (not implemented): taint/approval/rate-limit/budget gates
+  # require_approval_if:
+  #   - taint.conflicted_external_egress == true
+  #   - action.category == "external_egress"
+  # limits:
+  #   max_calls_per_task: 100
+  #   max_calls_per_minute: 30
+
+audit:
+  # Planned: decision/audit fields emitted by runtime
+  log_decisions: true
+  # redact_arguments: true
+

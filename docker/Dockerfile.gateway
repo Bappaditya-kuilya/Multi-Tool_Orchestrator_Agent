@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+# ScopeGate gateway Dockerfile (scaffold/prep for real cargo builds)
+# Tries to build the `gateway` crate; falls back to a placeholder binary so the
+# image remains buildable while runtime targets/wiring are incomplete.
+
+# Keep aligned with rust-toolchain.toml when practical.
+ARG RUST_VERSION=1.77
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+
+WORKDIR /workspace
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Workspace manifests first for layer caching.
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
+COPY crates ./crates
+COPY scopegate.toml.example ./scopegate.toml.example
+# COPY policies ./policies
+
+# Build gateway package (release). If crate/bin naming differs or build is not
+# ready in this snapshot, emit a placeholder to keep compose/dev workflows usable.
+RUN set -eux; \
+    cargo build --release -p gateway || cargo build --release -p scopegate-gateway || true; \
+    mkdir -p /workspace/target/release; \
+    if [ -x /workspace/target/release/gateway ]; then \
+      cp /workspace/target/release/gateway /workspace/target/release/scopegate-gateway-bin; \
+    elif [ -x /workspace/target/release/scopegate-gateway ]; then \
+      cp /workspace/target/release/scopegate-gateway /workspace/target/release/scopegate-gateway-bin; \
+    else \
+      printf '%s\n' '#!/bin/sh' 'echo "ScopeGate gateway placeholder (runtime not fully implemented)"' 'echo "Set SCOPEGATE_CONFIG/SCOPEGATE_BIND_ADDR/RUST_LOG and rebuild when gateway target is ready."' 'exec sleep infinity' > /workspace/target/release/scopegate-gateway-bin; \
+      chmod +x /workspace/target/release/scopegate-gateway-bin; \
+    fi
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin scopegate
+
+WORKDIR /app
+COPY --from=builder /workspace/target/release/scopegate-gateway-bin /usr/local/bin/scopegate-gateway
+COPY --from=builder /workspace/scopegate.toml.example /app/scopegate.toml
+
+ENV SCOPEGATE_BIND_ADDR=0.0.0.0:8080 \
+    SCOPEGATE_CONFIG=/app/scopegate.toml \
+    RUST_LOG=info
+
+EXPOSE 8080
+# Admin/ops ports may be split later when implemented.
+
+USER scopegate
+ENTRYPOINT ["/usr/local/bin/scopegate-gateway"]
+# CMD ["--config", "/app/scopegate.toml"] # enable when CLI args are finalized

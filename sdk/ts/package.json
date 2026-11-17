@@ -1,0 +1,26 @@
+{
+  "name": "@scopegate/sdk",
+  "private": true,
+  "version": "0.0.1-dev",
+  "description": "ScopeGate TypeScript SDK (API-shaped scaffold; runtime transport/integration pending)",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": ["src", "README.md", "tsconfig.json"],
+  "scripts": {
+    "build": "echo \"TODO: implement build (tsc) once runtime API stabilizes\"",
+    "typecheck": "echo \"TODO: tsc --noEmit (requires typescript devDependency/tooling)\"",
+    "test": "echo \"TODO: implement tests against runtime/gateway contract\"",
+    "lint": "echo \"TODO: implement lint\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
