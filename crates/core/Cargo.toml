@@ -1,0 +1,25 @@
+[package]
+name = "core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Runtime-aligned defaults: enable strong audit hashing integration by default.
+default = ["sha2"]
+sha2 = ["dep:sha2", "dep:hex"]
+biscuit = ["dep:biscuit-auth"]
+cedar = ["dep:cedar-policy"]
+
+[dependencies]
+biscuit-auth = { workspace = true, optional = true }
+cedar-policy = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,88 @@
+# ScopeGate - development compose (S1 scaffold/prep)
+# Intent: single gateway node + dashboard dev server with SQLite/WAL state volume.
+# Runtime is not fully implemented: /healthz and real MCP/API behavior may be unavailable.
+# Use scripts/build_gateway.sh + scripts/run_gateway.sh for direct cargo/gateway runs during development.
+
+name: scopegate
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+      args:
+        RUST_VERSION: "1.77"
+    image: scopegate-gateway:dev
+    container_name: scopegate-gateway
+    ports:
+      - "8080:8080"   # MCP + API/ops (planned; may split ports later)
+    environment:
+      SCOPEGATE_CONFIG: /app/scopegate.toml
+      SCOPEGATE_BIND_ADDR: 0.0.0.0:8080
+      SCOPEGATE_STORE_BACKEND: sqlite # sqlite|postgres (S2 planned)
+      SCOPEGATE_DATABASE_URL: sqlite:///data/scopegate.db
+      SCOPEGATE_FAIL_CLOSED_ON_AUDIT_ERROR: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+      # SCOPEGATE_ADMIN_BIND_ADDR: 0.0.0.0:8081
+      # SCOPEGATE_REDIS_URL: redis://redis:6379 (S2 events/approvals)
+    volumes:
+      - ../scopegate.toml.example:/app/scopegate.toml:ro
+      - gateway-data:/data
+    healthcheck:
+      # /healthz is planned (M6); may fail until implemented. Treat as best-effort probe.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  dashboard:
+    # Dev scaffold: runs Vite against mounted dashboard source. No backend integration yet.
+    image: node:20-alpine
+    container_name: scopegate-dashboard
+    working_dir: /app
+    command: ["sh", "-c", "npm ci && npm run dev -- --host 0.0.0.0 --port 3000"]
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_GATEWAY_URL: ${VITE_GATEWAY_URL:-http://localhost:8080}
+    volumes:
+      - ../dashboard:/app
+      - dashboard-node-modules:/app/node_modules
+    depends_on:
+      gateway:
+        condition: service_started
+    restart: unless-stopped
+
+  # --- S2 profile placeholders (enable when multi-node/HA work begins) ---
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_DB: scopegate
+  #     POSTGRES_USER: scopegate
+  #     POSTGRES_PASSWORD: change-me
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U scopegate -d scopegate"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #
+  # redis:
+  #   image: redis:7-alpine
+  #   command: ["redis-server", "--appendonly", "yes"]
+  #   volumes:
+  #     - redis-data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+
+volumes:
+  gateway-data:
+  dashboard-node-modules:
+  # postgres-data:
+  # redis-data:
