@@ -1,0 +1,5 @@
+# Workspace toolchain baseline. Keep aligned with CI/dev expectations.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

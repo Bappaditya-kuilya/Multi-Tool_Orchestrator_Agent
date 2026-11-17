@@ -1,0 +1,37 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+broker = { path = "../broker" }
+scopegate-core = { path = "../core", package = "core" }
+futures-core = "0.3"
+hex.workspace = true
+mcp-pool = { path = "../mcp-pool" }
+serde.workspace = true
+serde_json.workspace = true
+store = { path = "../store" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

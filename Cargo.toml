@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/core",
+  "crates/gateway",
+  "crates/mcp-front",
+  "crates/mcp-pool",
+  "crates/broker",
+  "crates/store",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# --- Serialization / errors / ids ---
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# --- Async / web stack ---
+axum = { version = "0.7", features = ["macros", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-std", "io-util"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- Crypto / hashing / storage ---
+hex = "0.4"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "macros", "migrate", "uuid", "json"] }
+
+# --- MCP / policy / tokens (planned integrations) ---
+biscuit-auth = "5"
+cedar-policy = "4"
+rmcp = { version = "0.8", features = ["client", "server", "transport-io"] }
