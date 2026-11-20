@@ -12,7 +12,7 @@ export default function DryRun() {
   return (
     <section className="screen">
       <h1>Dry Run</h1>
-      <p className="subtitle">Simulated policy decisions (logs what would happen without blocking). Mode: <span className="badge info">dry-run</span> <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span></p>
+      <p className="subtitle">Mock/preview simulated policy decisions (UI scaffold only; no gateway dry-run API endpoint). Shows example outcomes without blocking. Mode: <span className="badge info">dry-run</span> <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span></p>
       {loading ? <div className="panel"><p className="muted">Loading scenarios…</p></div> : (
         <>
           <div className="grid" style={{ marginBottom: 16 }}>

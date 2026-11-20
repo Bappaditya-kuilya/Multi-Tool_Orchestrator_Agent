@@ -9,28 +9,40 @@ export default function Audit() {
   const [source, setSource] = useState<'live' | 'mock'>('mock')
   const [verified, setVerified] = useState<boolean | null>(null)
   const [verifySource, setVerifySource] = useState<'live' | 'mock' | null>(null)
+  const [verifyDetail, setVerifyDetail] = useState<string | null>(null)
 
+  const [queryChain, setQueryChain] = useState<boolean | null>(null)
   const load = async () => {
     setLoading(true)
     const res = await api.getAudit()
-    setEntries(res.data)
+    setEntries(res.data.entries)
+    setQueryChain(res.data.chainVerified ?? null)
     setSource(res.source)
     setError(res.error || null)
-    setVerified(null); setVerifySource(null)
+    setVerified(null); setVerifySource(null); setVerifyDetail(null)
     setLoading(false)
   }
   useEffect(() => { void load() }, [])
-  const verify = async () => { const res = await api.verifyAuditChain(); setVerified(res.data); setVerifySource(res.source) }
+  const verify = async () => {
+    const res = await api.verifyAuditChain()
+    setVerified(res.data.ok)
+    setVerifySource(res.source)
+    const r = res.data.report
+    const bits = [r?.message || null, r?.checked_events != null ? `${r.checked_events} checked` : null, r?.first_bad_seq != null ? `first bad seq ${r.first_bad_seq}` : null].filter(Boolean)
+    setVerifyDetail(bits.length ? bits.join(' · ') : (res.error || null))
+  }
 
   return (
     <section className="screen">
       <h1>Audit</h1>
-      <p className="subtitle">Hash-chained audit log from GET /v1/audit when available (envelope-wrapped events, chain_verified). Hash fields may be hex strings or byte arrays.</p>
+      <p className="subtitle">Hash-chained audit log from GET /v1/audit when available (envelope-wrapped events, chain_verified). Verify uses GET /v1/audit/verify when available.</p>
       <div className="panel filters" aria-label="Audit chain verification">
         <button className="btn" type="button" onClick={() => void load()} disabled={loading}>Refresh</button>
         <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span>
         <button className="btn" type="button" onClick={() => void verify()} aria-label="Verify audit hash chain">Verify chain</button>
-        {verified !== null && <span className={`badge ${verified ? 'approved' : 'denied'}`} role="status">{verified ? 'chain valid' : 'chain broken'}{verifySource ? ` (${verifySource})` : ''}</span>}
+        {queryChain !== null && <span className={`badge ${queryChain ? 'approved' : 'denied'}`} title="chain_verified from GET /v1/audit">query: {queryChain ? 'valid' : 'invalid'}</span>}
+        {verified !== null && <span className={`badge ${verified ? 'approved' : 'denied'}`} role="status">verify: {verified ? 'chain valid' : 'chain broken'}{verifySource ? ` (${verifySource})` : ''}</span>}
+        {verifyDetail && <span className="muted small">{verifyDetail}</span>}
         {error && <span className="muted"><span className="badge warn">gateway</span> {error}</span>}
       </div>
       <div className="panel">

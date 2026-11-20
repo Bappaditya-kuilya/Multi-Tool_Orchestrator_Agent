@@ -21,7 +21,7 @@ export default function Upstreams() {
   return (
     <section className="screen">
       <h1>Upstreams</h1>
-      <p className="subtitle">Connected MCP services from GET /v1/upstreams when available (id/name/transport/target/secret_ref/enabled)</p>
+      <p className="subtitle">Forward-compatible upstream view (id/name/transport/target/secret_ref/enabled). Current gateway does not expose a <code>/v1/upstreams</code> endpoint; this screen uses mock/fallback data unless a future build adds that route.</p>
       <div className="panel filters">
         <button className="btn" type="button" onClick={() => void load()} disabled={loading}>Refresh</button>
         <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span>

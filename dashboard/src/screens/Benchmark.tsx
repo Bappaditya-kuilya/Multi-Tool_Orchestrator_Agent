@@ -18,8 +18,9 @@ export default function Benchmark() {
   return (
     <section className="screen">
       <h1>Benchmark</h1>
-      <p className="subtitle">Latest run vs baseline, with dry-run outcome counts and chart placeholders <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span></p>
+      <p className="subtitle">Mock/preview benchmark view (no gateway benchmark endpoint or artifact ingestion in current dashboard). Latest sample run vs baseline, dry-run counts, and chart placeholders <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span></p>
       {error && <div className="panel"><span className="muted"><span className="badge info">note</span> {error} (using mock benchmark data)</span></div>}
+      {source !== 'live' && <div className="panel"><span className="muted"><span className="badge info">preview</span> Figures below are static mock data for UI scaffolding, not captured live gateway/enforce-mode evidence.</span></div>}
       {loading ? <div className="panel"><p className="muted">Loading benchmarks…</p></div> : (
         <>
           <div className="grid" style={{ marginBottom: 16 }}>

@@ -1,7 +1,7 @@
 import { client, ApiError } from './client'
 import { isApiConfigured } from './config'
 import { mock } from './mockData'
-import type { ApiAuditLog, ApiTask, Approval, ApprovalStatus, AuditEntry, Benchmark, Policy, TaskNode, TimelineEvent, Upstream } from '../types'
+import type { ApiAuditLog, ApiTask, Approval, ApprovalStatus, AuditEntry, AuditVerificationReport, Benchmark, Policy, TaskNode, TimelineEvent, Upstream } from '../types'
 
 export type Source = 'live' | 'mock'
 export type WithSource<T> = { data: T; source: Source; error?: string }
@@ -110,9 +110,38 @@ export const api = {
   async getTaskTree(): Promise<WithSource<TaskNode[]>> {
     return tryLive(async () => tasksToTree(await client.getTasks()), mock.getTaskTree)
   },
+  async getTask(id: string): Promise<WithSource<TaskNode>> {
+    return tryLive(async () => {
+      const t = await client.getTask(id)
+      return { id: t.id, title: t.id, status: taskStatus(t), tokens: 0, detail: `scopes: ${scopesText(t.scopes)} · budget: ${t.budget ?? '—'}`, api: t } as TaskNode
+    }, async () => {
+      const roots = await mock.getTaskTree()
+      const flat = (nodes: TaskNode[]): TaskNode[] => nodes.flatMap(n => [n, ...flat(n.children || [])])
+      const found = flat(roots).find(n => n.id === id)
+      if (!found) throw new Error(`task not found: ${id}`)
+      return found
+    })
+  },
+  async revokeTask(id: string, payload: { reason?: string; revoked_by?: string } = {}): Promise<WithSource<TaskNode>> {
+    if (!isApiConfigured()) return { data: await this.getTask(id).then(r => r.data), source: 'mock', error: 'API base URL not configured' }
+    try {
+      const t = await client.revokeTask(id, { ...payload, revoked_by: payload.revoked_by || 'dashboard' })
+      return { data: { id: t.id, title: t.id, status: taskStatus(t), tokens: 0, detail: `scopes: ${scopesText(t.scopes)} · budget: ${t.budget ?? '—'}`, api: t }, source: 'live' }
+    } catch (e) {
+      const fallback = await this.getTask(id)
+      return { data: fallback.data, source: fallback.source, error: errMsg(e) }
+    }
+  },
   async getApprovals(): Promise<WithSource<Approval[]>> {
-    // Gateway currently exposes create/resolve via POST /v1/approvals but no list endpoint.
-    return tryLive(async () => { throw new Error('approvals list endpoint not available on gateway (POST /v1/approvals supports create/resolve)') }, mock.getApprovals)
+    return tryLive(async () => (await client.getApprovals()).map(toApproval), mock.getApprovals)
+  },
+  async getApproval(id: string): Promise<WithSource<Approval>> {
+    return tryLive(async () => toApproval(await client.getApproval(id)), async () => {
+      const items = await mock.getApprovals()
+      const found = items.find(a => a.id === id)
+      if (!found) throw new Error(`approval not found: ${id}`)
+      return found
+    })
   },
   async decideApproval(id: string, status: ApprovalStatus, note: string): Promise<WithSource<Approval>> {
     if (!isApiConfigured()) return { data: await mock.decideApproval(id, status, note), source: 'mock', error: 'API base URL not configured' }
@@ -126,16 +155,20 @@ export const api = {
       return { data: await mock.decideApproval(id, status, note), source: 'mock', error: errMsg(e) }
     }
   },
-  async getAudit(): Promise<WithSource<AuditEntry[]>> {
-    return tryLive(async () => ((await client.getAudit()).events || []).map(toAudit), mock.getAudit)
-  },
-  async verifyAuditChain(): Promise<WithSource<boolean>> {
+  async getAudit(): Promise<WithSource<{ entries: AuditEntry[]; chainVerified?: boolean; verification?: AuditVerificationReport }>> {
     return tryLive(async () => {
       const res = await client.getAudit()
-      if (typeof res.chain_verified === 'boolean') return res.chain_verified
-      const sorted = (res.events || []).slice().sort((a,b)=>a.seq-b.seq)
-      return sorted.every((e, i) => !!e.hash && hashText(e.prev_hash) === (i ? hashText(sorted[i - 1].hash) : 'GENESIS'))
-    }, mock.verifyAuditChain)
+      return { entries: (res.events || []).map(toAudit), chainVerified: !!res.chain_verified, verification: res.verification as AuditVerificationReport | undefined }
+    }, async () => ({ entries: await mock.getAudit(), chainVerified: await mock.verifyAuditChain(), verification: { ok: await mock.verifyAuditChain(), checked_events: (await mock.getAudit()).length, message: 'mock audit chain' } }))
+  },
+  async verifyAuditChain(): Promise<WithSource<{ ok: boolean; report?: AuditVerificationReport }>> {
+    return tryLive(async () => {
+      const report = await client.verifyAudit()
+      return { ok: !!report?.ok, report }
+    }, async () => {
+      const ok = await mock.verifyAuditChain()
+      return { ok, report: { ok, checked_events: 0, message: ok ? 'mock chain valid' : 'mock chain broken' } }
+    })
   },
   async getBenchmarks(): Promise<WithSource<Benchmark[]>> {
     return tryLive(async () => { throw new Error('benchmark endpoint not configured') }, mock.getBenchmarks)
@@ -164,6 +197,12 @@ export const api = {
   },
   async getStreamEvents(): Promise<WithSource<import('../types').StreamEvent[]>> {
     return { data: await mock.getStreamEvents(), source: 'mock' }
+  },
+  async getOps(): Promise<WithSource<{ health: unknown; ready: unknown; metrics: string }>> {
+    return tryLive(async () => {
+      const [health, ready, metrics] = await Promise.all([client.healthz(), client.readyz(), client.metrics()])
+      return { health, ready, metrics: typeof metrics === 'string' ? metrics : String(metrics ?? '') }
+    }, async () => ({ health: { status: 'ok', source: 'mock' }, ready: { ready: false, reason: 'mock mode' }, metrics: '# mock metrics unavailable\n' }))
   },
   async getDryRunScenarios(): Promise<WithSource<{ id: string; tool: string; taskId: string; args: string; decision: string; reason: string; policy: string }[]>> {
     return { data: await mock.getDryRunScenarios(), source: 'mock' }

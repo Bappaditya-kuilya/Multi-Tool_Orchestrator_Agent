@@ -14,9 +14,20 @@ export interface ApiTask {
   budget?: number
   expires_at?: string
   revoked?: boolean
+  revocation_reason?: string | null
+  taint_snapshot_id?: string | null
   state?: string
   stage?: string | null
   allowed?: boolean | null
+}
+
+export interface AuditVerificationReport {
+  ok: boolean
+  checked_events: number
+  first_bad_seq?: number | null
+  message?: string | null
+  expected_hash_hex?: string | null
+  actual_hash_hex?: string | null
 }
 
 export interface ApiApproval {

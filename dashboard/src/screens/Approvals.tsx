@@ -18,12 +18,12 @@ export default function Approvals() {
   const [error, setError] = useState<string | null>(null)
   const [source, setSource] = useState<'live' | 'mock'>('mock')
 
-  const load = async () => {
+  const load = async (keepError?: string | null) => {
     setLoading(true)
     const res = await api.getApprovals()
     setItems(res.data)
     setSource(res.source)
-    setError(res.error || null)
+    setError(keepError || res.error || null)
     setLoading(false)
   }
   useEffect(() => { void load() }, [])
@@ -31,8 +31,7 @@ export default function Approvals() {
   const act = async (id: string, status: ApprovalStatus) => {
     setBusy(id)
     const res = await api.decideApproval(id, status, `resolve -> ${status} via dashboard`)
-    if (res.error) setError(res.error)
-    await load()
+    await load(res.error || null)
     setBusy(null)
   }
 
@@ -40,7 +39,7 @@ export default function Approvals() {
   return (
     <section className="screen">
       <h1>Approvals</h1>
-      <p className="subtitle">Queue with resolve actions via POST /v1/approvals (id/action). Gateway currently has no list endpoint; live mode may fall back to mock data with an error message.</p>
+      <p className="subtitle">Queue with list/get/create/resolve flows when available. Dashboard resolve uses POST /v1/approvals (id/action) for compatibility with current gateway behavior; UI degrades gracefully on unavailable/fail-closed responses.</p>
       <div className="panel filters">
         <button className="btn" type="button" onClick={() => void load()} disabled={loading}>Refresh</button>
         <span className={`badge ${source === 'live' ? 'healthy' : 'info'}`}>{source}</span>

@@ -7,6 +7,7 @@ import Upstreams from './screens/Upstreams'
 import Audit from './screens/Audit'
 import Benchmark from './screens/Benchmark'
 import DryRun from './screens/DryRun'
+import Ops from './screens/Ops'
 import { API_BASE_URL, isApiConfigured, STREAM_PATH, useStream } from './api'
 
 const screens = [
@@ -16,6 +17,7 @@ const screens = [
   { id: 'policies', label: 'Policies', component: Policies },
   { id: 'upstreams', label: 'Upstreams', component: Upstreams },
   { id: 'audit', label: 'Audit', component: Audit },
+  { id: 'ops', label: 'Ops/MCP', component: Ops },
   { id: 'benchmark', label: 'Benchmark', component: Benchmark },
   { id: 'dry-run', label: 'Dry Run', component: DryRun },
 ] as const
