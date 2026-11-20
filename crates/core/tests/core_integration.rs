@@ -48,7 +48,7 @@ fn taint_policy_and_egress_policy_align() {
         sensitive: true,
     });
     let hooks = context_hooks_detailed(&req);
-    assert!(hooks.iter().any(|(_, r, _)| r.code == "taint_sensitive"));
+    assert!(hooks.iter().any(|(_, r, _)| r.code == "taint_active"));
 
     let eval = evaluate(&req, &[Rule::for_tool("egress", PolicyDecision::Permit)]);
     assert_eq!(eval.decision, PolicyDecision::RequireApproval);
@@ -180,4 +180,37 @@ fn core_exports_and_constructors_are_integration_ready() {
     assert_eq!(eval.decision, PolicyDecision::RequireApproval);
 
     assert_eq!(TokenError::BudgetExhausted.to_string(), "budget exhausted");
+}
+
+#[test]
+fn taint_state_context_hook_helper_supports_fail_closed_live_policy_hints() {
+    let clean = SessionTaint::new();
+    assert!(clean.to_policy_taint_hint().is_none());
+
+    let tainted = SessionTaint::new()
+        .with_label(TaintLabel::UntrustedContent)
+        .with_label(TaintLabel::PrivateData);
+    let hint = tainted.to_policy_taint_hint().expect("taint hint");
+    assert!(hint.sensitive);
+    assert!(hint.has_label("untrusted_content"));
+    assert!(hint.has_label("private_data"));
+
+    let summary_hint = tainted
+        .summary()
+        .to_policy_taint_hint()
+        .expect("summary hint");
+    assert_eq!(summary_hint.labels, hint.labels);
+    assert!(summary_hint.sensitive);
+
+    let mut req = PolicyRequest::new("agent", "tool:egress", "external");
+    req.context = req.context.with_taint(hint);
+    let hooks = context_hooks_detailed(&req);
+    assert!(hooks
+        .iter()
+        .any(|(d, r, _)| { *d == PolicyDecision::RequireApproval && r.code == "taint_active" }));
+    let eval = evaluate(
+        &req,
+        &[Rule::for_tool("tool:egress", PolicyDecision::Permit)],
+    );
+    assert_eq!(eval.decision, PolicyDecision::RequireApproval);
 }

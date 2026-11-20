@@ -165,6 +165,36 @@ impl InMemoryRateLimitTracker {
             .unwrap_or(0)
     }
 
+    fn task_scope_key(token_id: &str, task_id: &str) -> String {
+        format!("{token_id}\0task\0{task_id}")
+    }
+
+    /// Returns budget units consumed in the isolated per-task bucket for `(token, task)`.
+    pub fn token_task_budget_used(&self, token_id: &str, task_id: &str) -> u64 {
+        self.token_budget_used(&Self::task_scope_key(token_id, task_id))
+    }
+
+    /// Returns total calls recorded in the isolated per-task bucket for `(token, task)`.
+    pub fn token_task_total_calls(&self, token_id: &str, task_id: &str) -> u32 {
+        self.token_total_calls(&Self::task_scope_key(token_id, task_id))
+    }
+
+    /// Returns windowed/non-windowed calls for `(token, task)` in the isolated task bucket.
+    pub fn token_task_calls(&self, token_id: &str, task_id: &str, now: u64) -> u32 {
+        self.token_calls(&Self::task_scope_key(token_id, task_id), now)
+    }
+
+    /// Returns windowed/non-windowed tool calls for `(token, task, tool)` in the isolated task bucket.
+    pub fn token_task_tool_calls(
+        &self,
+        token_id: &str,
+        task_id: &str,
+        tool: &str,
+        now: u64,
+    ) -> u32 {
+        self.token_tool_calls(&Self::task_scope_key(token_id, task_id), tool, now)
+    }
+
     /// Check limits/budget without mutating counters. `budget_units` represents
     /// units that would be consumed by the operation (0 for a plain call check).
     pub fn check(&self, token_id: &str, tool: &str, now: u64, budget_units: u64) -> LimitDecision {
@@ -294,6 +324,60 @@ impl InMemoryRateLimitTracker {
             decision
         }
     }
+
+    /// Check limits/budget for an isolated per-task bucket `(token, task)`.
+    /// This enables per-token/tool/task enforcement as feasible without changing
+    /// existing token-scoped behavior.
+    pub fn check_for_task(
+        &self,
+        token_id: &str,
+        task_id: &str,
+        tool: &str,
+        now: u64,
+        budget_units: u64,
+    ) -> LimitDecision {
+        self.check(
+            &Self::task_scope_key(token_id, task_id),
+            tool,
+            now,
+            budget_units,
+        )
+    }
+
+    /// Consume units in an isolated per-task bucket `(token, task)`.
+    pub fn consume_for_task(
+        &mut self,
+        token_id: &str,
+        task_id: &str,
+        tool: impl Into<String>,
+        now: u64,
+        budget_units: u64,
+    ) -> LimitDecision {
+        self.consume(
+            Self::task_scope_key(token_id, task_id),
+            tool,
+            now,
+            budget_units,
+        )
+    }
+
+    /// Fail-closed enforcement for an isolated per-task bucket `(token, task)`.
+    /// Permits and consumes only when the task-scoped check passes.
+    pub fn enforce_for_task(
+        &mut self,
+        token_id: &str,
+        task_id: &str,
+        tool: impl Into<String>,
+        now: u64,
+        budget_units: u64,
+    ) -> LimitDecision {
+        self.enforce(
+            Self::task_scope_key(token_id, task_id),
+            tool,
+            now,
+            budget_units,
+        )
+    }
 }
 
 /// Enforcement API abstraction for rate/budget/call-count gates.
@@ -335,6 +419,23 @@ pub fn enforce_into_context<E: RateBudgetEnforcer + ?Sized>(
     ctx: crate::policy::Context,
 ) -> (LimitDecision, crate::policy::Context) {
     let decision = enforcer.enforce(token_id, tool, now, budget_units);
+    let mut ctx = decision.apply_to_context(ctx);
+    ctx.normalize_limits();
+    (decision, ctx)
+}
+
+/// Runtime helper: enforce task-scoped limits and project hints into a policy context.
+/// Uses isolated per-task counters in [`InMemoryRateLimitTracker`].
+pub fn enforce_task_into_context(
+    tracker: &mut InMemoryRateLimitTracker,
+    token_id: &str,
+    task_id: &str,
+    tool: &str,
+    now: u64,
+    budget_units: u64,
+    ctx: crate::policy::Context,
+) -> (LimitDecision, crate::policy::Context) {
+    let decision = tracker.enforce_for_task(token_id, task_id, tool, now, budget_units);
     let mut ctx = decision.apply_to_context(ctx);
     ctx.normalize_limits();
     (decision, ctx)
@@ -491,5 +592,45 @@ mod tests {
 
         let checked = RateBudgetEnforcer::check(&tracker, "t", "x", 1, 0);
         assert_eq!(checked.decision, PolicyDecision::RequireApproval);
+    }
+
+    #[test]
+    fn task_scoped_counters_and_enforcement_are_isolated_and_fail_closed() {
+        let mut tracker = InMemoryRateLimitTracker::new(Limits {
+            per_token_call_limit: Some(1),
+            per_token_budget: Some(10),
+            ..Limits::default()
+        });
+        let ok = tracker.enforce_for_task("tok", "task-a", "tool", 0, 4);
+        assert!(ok.is_allowed());
+        assert_eq!(tracker.token_task_total_calls("tok", "task-a"), 1);
+        assert_eq!(tracker.token_task_budget_used("tok", "task-a"), 4);
+        assert_eq!(tracker.token_task_tool_calls("tok", "task-a", "tool", 0), 1);
+
+        let blocked = tracker.check_for_task("tok", "task-a", "tool", 1, 0);
+        assert_eq!(blocked.decision, PolicyDecision::RequireApproval);
+        assert!(blocked.reasons.iter().any(|r| r.contains("call count")));
+        let denied = tracker.enforce_for_task("tok", "task-a", "tool", 1, 0);
+        assert_eq!(denied.decision, PolicyDecision::RequireApproval);
+        assert_eq!(tracker.token_task_total_calls("tok", "task-a"), 1); // no consume on deny
+
+        // isolated from other task and from token-level bucket
+        assert!(tracker
+            .enforce_for_task("tok", "task-b", "tool", 1, 2)
+            .is_allowed());
+        assert_eq!(tracker.token_task_total_calls("tok", "task-b"), 1);
+        assert_eq!(tracker.token_total_calls("tok"), 0);
+
+        let (d, ctx) = enforce_task_into_context(
+            &mut tracker,
+            "tok",
+            "task-c",
+            "tool",
+            5,
+            20,
+            crate::policy::Context::default(),
+        );
+        assert_eq!(d.decision, PolicyDecision::RequireApproval);
+        assert!(ctx.budget.as_ref().is_some_and(|b| b.exceeded));
     }
 }

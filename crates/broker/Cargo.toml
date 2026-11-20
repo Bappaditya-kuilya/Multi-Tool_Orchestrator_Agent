@@ -9,6 +9,9 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
+store = { path = "../store" }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio.workspace = true

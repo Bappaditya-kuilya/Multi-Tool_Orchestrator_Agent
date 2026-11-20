@@ -3,10 +3,10 @@
 use async_trait::async_trait;
 
 use crate::{
-    apply_migrations, compute_audit_hash, migrations::sqlite_migrations, verify_audit_chain_events,
-    ApprovalRecord, ApprovalStatus, AuditEvent, AuditQuery, AuditVerificationReport, BackendKind,
-    PolicyRecord, RevocationQuery, RevocationRecord, Store, StoreConfig, StoreError, StoreResult,
-    TaintSnapshotQuery, TaintSnapshotRecord, TaskQuery, TaskRecord,
+    apply_migrations, verify_audit_chain_events, ApprovalQuery, ApprovalRecord, ApprovalStatus,
+    AuditEvent, AuditQuery, AuditVerificationReport, BackendKind, PolicyRecord, RevocationQuery,
+    RevocationRecord, Store, StoreConfig, StoreError, StoreResult, TaintSnapshotQuery,
+    TaintSnapshotRecord, TaskQuery, TaskRecord,
 };
 
 #[cfg(feature = "sqlite-sqlx")]
@@ -38,27 +38,50 @@ impl SqliteStore {
         })
     }
 
-    /// Connect a durable pool and apply WAL pragmas.
+    /// Connect a durable pool and apply WAL/durability pragmas.
     #[cfg(feature = "sqlite-sqlx")]
     pub async fn connect(&mut self) -> StoreResult<()> {
-        let pool = SqlitePool::connect(&self.config.database_url)
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::str::FromStr;
+
+        // Per-connection pragmas: foreign_keys/busy_timeout/synchronous are connection-scoped.
+        let pool = SqlitePoolOptions::new()
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA foreign_keys=ON;")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA synchronous=FULL;")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout=5000;")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::from_str(&self.config.database_url)
+                    .map_err(|e| StoreError::Invalid(format!("sqlite database_url: {e}")))?,
+            )
             .await
             .map_err(|e| map_durable_error("sqlite connect", e))?;
+
+        // journal_mode is database-scoped (persistent for file DBs); set once on connect.
+        // In-memory/shared-cache URLs may report `memory` instead of `wal`.
         sqlx::query("PRAGMA journal_mode=WAL;")
             .execute(&pool)
             .await
             .map_err(|e| map_durable_error("sqlite pragma journal_mode=WAL", e))?;
-        sqlx::query("PRAGMA foreign_keys=ON;")
-            .execute(&pool)
-            .await
-            .map_err(|e| map_durable_error("sqlite pragma foreign_keys", e))?;
+
         self.pool = Some(pool);
         Ok(())
     }
 
     /// Apply embedded SQL migrations in order.
+    ///
+    /// Idempotent/restart-safe: delegates to shared migration tracking.
     pub async fn migrate(&self) -> StoreResult<Vec<i64>> {
-        let _planned: Vec<i64> = sqlite_migrations().iter().map(|m| m.version).collect();
         apply_migrations(BackendKind::SqliteWal, &self.config.database_url).await
     }
 
@@ -131,32 +154,55 @@ impl Store for SqliteStore {
         BackendKind::SqliteWal
     }
 
-    async fn append_audit_event(&self, mut event: AuditEvent) -> StoreResult<AuditEvent> {
+    async fn append_audit_event(&self, event: AuditEvent) -> StoreResult<AuditEvent> {
         #[cfg(feature = "sqlite-sqlx")]
         {
+            event.validate_for_append()?;
             let pool = self.pool()?;
-            let mut tx = pool
-                .begin()
+            // Immediate tx serializes writers so seq/head chain is stable; commit before return.
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|e| map_durable_error("sqlite acquire audit append", e))?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| map_durable_error("sqlite begin audit append", e))?;
-            // tx semantics placeholder: BEGIN gives atomic append-before-return; head read inside tx
-            let head = sqlx::query("SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1")
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| map_durable_error("sqlite read audit head", e))?;
+
+            let head =
+                match sqlx::query("SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+                    .fetch_optional(&mut *conn)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(map_durable_error("sqlite read audit head", e));
+                    }
+                };
             let (next_seq, prev_hash): (i64, Option<Vec<u8>>) = if let Some(r) = head {
-                let s: i64 = r
-                    .try_get("seq")
-                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                let s: i64 = match r.try_get("seq") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(StoreError::Invalid(e.to_string()));
+                    }
+                };
                 let h: Option<Vec<u8>> = r.try_get("hash").ok();
                 (s + 1, h)
             } else {
                 (1, None)
             };
-            event.seq = next_seq;
-            event.prev_hash = prev_hash;
-            event.hash = Some(compute_audit_hash(&event));
-            sqlx::query(
+            let event = match crate::AuditAppendPlan::for_tail(event, prev_hash.clone())
+                .materialize(next_seq, prev_hash)
+            {
+                Ok(ev) => ev,
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
+            };
+            let ins = sqlx::query(
                 "INSERT INTO audit_events (seq, ts, task_id, tool, decision, reason, args_digest, result_digest, prev_hash, hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
@@ -170,16 +216,30 @@ impl Store for SqliteStore {
             .bind(&event.result_digest)
             .bind(&event.prev_hash)
             .bind(&event.hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_durable_error("sqlite insert audit event", e))?;
-            tx.commit()
-                .await
-                .map_err(|e| map_durable_error("sqlite commit audit append", e))?;
+            .execute(&mut *conn)
+            .await;
+            if let Err(e) = ins {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") || msg.contains("PRIMARY KEY") {
+                    return Err(StoreError::Conflict(format!(
+                        "audit append conflict at seq {}: {msg}",
+                        event.seq
+                    )));
+                }
+                return Err(map_durable_error("sqlite insert audit event", e));
+            }
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(map_durable_error("sqlite commit audit append", e));
+            }
             return Ok(event);
         }
         #[cfg(not(feature = "sqlite-sqlx"))]
-        Err(self.durable_unavailable("sqlite append_audit_event"))
+        {
+            let _ = event;
+            Err(self.durable_unavailable("sqlite append_audit_event"))
+        }
     }
 
     async fn query_audit(&self, query: AuditQuery) -> StoreResult<Vec<AuditEvent>> {
@@ -353,6 +413,76 @@ impl Store for SqliteStore {
         }
     }
 
+    async fn list_approvals(&self, query: ApprovalQuery) -> StoreResult<Vec<ApprovalRecord>> {
+        #[cfg(feature = "sqlite-sqlx")]
+        {
+            let pool = self.pool()?;
+            let mut sql = String::from(
+                "SELECT id, task_id, tool, args_hash, status, created_at, resolved_at, resolver FROM approvals WHERE 1=1",
+            );
+            let mut binds_i: i32 = 0;
+            if query.task_id.is_some() {
+                binds_i += 1;
+                sql.push_str(&format!(" AND task_id = ?{binds_i}"));
+            }
+            if query.status.is_some() {
+                binds_i += 1;
+                sql.push_str(&format!(" AND status = ?{binds_i}"));
+            }
+            let limit_idx = binds_i + 1;
+            let offset_idx = binds_i + 2;
+            sql.push_str(&format!(
+                " ORDER BY created_at ASC, id ASC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+            ));
+            let limit = query.limit.map(|v| v as i64).unwrap_or(-1);
+            let offset = query.offset.map(|v| v as i64).unwrap_or(0);
+            let mut q = sqlx::query(&sql);
+            if let Some(v) = query.task_id {
+                q = q.bind(v);
+            }
+            if let Some(v) = query.status {
+                q = q.bind(approval_status_to_str(v));
+            }
+            q = q.bind(limit).bind(offset);
+            let rows = q
+                .fetch_all(pool)
+                .await
+                .map_err(|e| map_durable_error("sqlite list approvals", e))?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let status_s: String = r
+                    .try_get("status")
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                out.push(ApprovalRecord {
+                    id: r
+                        .try_get("id")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    task_id: r
+                        .try_get("task_id")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    tool: r
+                        .try_get("tool")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    args_hash: r
+                        .try_get("args_hash")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    status: approval_status_from_str(&status_s)?,
+                    created_at: r
+                        .try_get("created_at")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    resolved_at: r.try_get("resolved_at").ok(),
+                    resolver: r.try_get("resolver").ok(),
+                });
+            }
+            return Ok(out);
+        }
+        #[cfg(not(feature = "sqlite-sqlx"))]
+        {
+            let _ = query;
+            Err(self.durable_unavailable("sqlite list_approvals"))
+        }
+    }
+
     async fn resolve_approval(
         &self,
         id: &str,
@@ -362,6 +492,11 @@ impl Store for SqliteStore {
     ) -> StoreResult<ApprovalRecord> {
         #[cfg(feature = "sqlite-sqlx")]
         {
+            if status == ApprovalStatus::Pending {
+                return Err(StoreError::Invalid(
+                    "cannot resolve approval to pending".into(),
+                ));
+            }
             let pool = self.pool()?;
             let mut tx = pool
                 .begin()
@@ -382,8 +517,8 @@ impl Store for SqliteStore {
             if cur != ApprovalStatus::Pending {
                 return Err(StoreError::Conflict("approval not pending".into()));
             }
-            sqlx::query(
-                "UPDATE approvals SET status = ?1, resolved_at = ?2, resolver = ?3 WHERE id = ?4",
+            let res = sqlx::query(
+                "UPDATE approvals SET status = ?1, resolved_at = ?2, resolver = ?3 WHERE id = ?4 AND status = 'pending'",
             )
             .bind(approval_status_to_str(status))
             .bind(&resolved_at)
@@ -392,6 +527,9 @@ impl Store for SqliteStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| map_durable_error("sqlite resolve approval", e))?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::Conflict("approval not pending".into()));
+            }
             tx.commit()
                 .await
                 .map_err(|e| map_durable_error("sqlite commit resolve approval", e))?;
@@ -683,7 +821,7 @@ impl Store for SqliteStore {
                 .begin()
                 .await
                 .map_err(|e| map_durable_error("sqlite begin revocation", e))?;
-            sqlx::query(
+            let ins = sqlx::query(
                 "INSERT INTO revocations (id, target_kind, target_id, reason, revoked_at, revoked_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
@@ -694,8 +832,17 @@ impl Store for SqliteStore {
             .bind(&record.revoked_at)
             .bind(&record.revoked_by)
             .execute(&mut *tx)
-            .await
-            .map_err(|e| map_durable_error("sqlite insert revocation", e))?;
+            .await;
+            if let Err(e) = ins {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") {
+                    return Err(StoreError::Conflict(format!(
+                        "revocation {} exists",
+                        record.id
+                    )));
+                }
+                return Err(map_durable_error("sqlite insert revocation", e));
+            }
             if record.target_kind == "task" {
                 sqlx::query("UPDATE tasks SET revoked = 1, revocation_reason = ?1 WHERE id = ?2")
                     .bind(&record.reason)
@@ -797,7 +944,7 @@ impl Store for SqliteStore {
                 .begin()
                 .await
                 .map_err(|e| map_durable_error("sqlite begin taint snapshot", e))?;
-            sqlx::query(
+            let ins = sqlx::query(
                 "INSERT INTO taint_snapshots (id, task_id, source, labels_json, digest, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
@@ -808,15 +955,47 @@ impl Store for SqliteStore {
             .bind(&snapshot.digest)
             .bind(&snapshot.created_at)
             .execute(&mut *tx)
-            .await
-            .map_err(|e| map_durable_error("sqlite insert taint snapshot", e))?;
+            .await;
+            if let Err(e) = ins {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") {
+                    return Err(StoreError::Conflict(format!(
+                        "taint snapshot {} exists",
+                        snapshot.id
+                    )));
+                }
+                return Err(map_durable_error("sqlite insert taint snapshot", e));
+            }
             if let Some(task_id) = &snapshot.task_id {
-                sqlx::query("UPDATE tasks SET taint_snapshot_id = ?1 WHERE id = ?2")
-                    .bind(&snapshot.id)
+                let cur: Option<(Option<String>, Option<String>)> =
+                    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                        "SELECT ts.created_at, ts.id
+                     FROM tasks t
+                     LEFT JOIN taint_snapshots ts ON ts.id = t.taint_snapshot_id
+                     WHERE t.id = ?1",
+                    )
                     .bind(task_id)
-                    .execute(&mut *tx)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| map_durable_error("sqlite link taint snapshot to task", e))?;
+                    .map_err(|e| map_durable_error("sqlite read task taint link", e))?;
+
+                let should_link = match cur {
+                    None => false, // task missing
+                    Some((None, _)) => true,
+                    Some((Some(cur_created), Some(cur_id))) => {
+                        (snapshot.created_at.as_str(), snapshot.id.as_str())
+                            >= (cur_created.as_str(), cur_id.as_str())
+                    }
+                    Some((Some(_), None)) => true,
+                };
+                if should_link {
+                    sqlx::query("UPDATE tasks SET taint_snapshot_id = ?1 WHERE id = ?2")
+                        .bind(&snapshot.id)
+                        .bind(task_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| map_durable_error("sqlite link taint snapshot to task", e))?;
+                }
             }
             tx.commit()
                 .await
@@ -1018,6 +1197,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.status, ApprovalStatus::Approved);
+        let listed = store
+            .list_approvals(ApprovalQuery {
+                task_id: Some("task1".into()),
+                status: Some(ApprovalStatus::Approved),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "ap1");
 
         store
             .upsert_task(TaskRecord {
@@ -1166,6 +1355,605 @@ mod tests {
         reopened.connect().await.unwrap();
         let rep = reopened.verify_audit_chain().await.unwrap();
         assert!(rep.ok && rep.checked_events == 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_taint_snapshot_conflict_and_latest_link() {
+        let store = setup("taint_latest_link").await;
+        store
+            .upsert_task(TaskRecord {
+                id: "t2".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 1,
+                expires_at: "later".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-new".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec!["new".into()],
+                digest: None,
+                created_at: "2026-01-02".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-old".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec!["old".into()],
+                digest: None,
+                created_at: "2026-01-01".into(),
+            })
+            .await
+            .unwrap();
+        let task = store.get_task("t2").await.unwrap().unwrap();
+        assert_eq!(task.taint_snapshot_id.as_deref(), Some("s-new"));
+
+        let err = store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-new".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec![],
+                digest: None,
+                created_at: "2026-01-02".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_taint_snapshot_for_missing_task_persists_without_link() {
+        let store = setup("taint_missing_task").await;
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-orphan".into(),
+                task_id: Some("nope".into()),
+                source: "broker".into(),
+                labels: vec!["x".into()],
+                digest: None,
+                created_at: "t1".into(),
+            })
+            .await
+            .unwrap();
+        assert!(store.get_task("nope").await.unwrap().is_none());
+        let snaps = store
+            .list_taint_snapshots(TaintSnapshotQuery {
+                task_id: Some("nope".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].id, "s-orphan");
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_file_db_restart_safe_state_and_migrations() {
+        let path = format!(
+            "/tmp/opencode/store-restart-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        store.connect().await.unwrap();
+        let first_mig = store.migrate().await.unwrap();
+        assert_eq!(first_mig, vec![1]);
+
+        store
+            .upsert_policy(PolicyRecord {
+                id: "p1".into(),
+                version: 1,
+                body: "a".into(),
+                created_at: "t1".into(),
+                active: true,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_task(TaskRecord {
+                id: "task1".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 3,
+                expires_at: "later".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .create_approval(ApprovalRecord {
+                id: "ap1".into(),
+                task_id: "task1".into(),
+                tool: "echo".into(),
+                args_hash: "h".into(),
+                status: ApprovalStatus::Pending,
+                created_at: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .resolve_approval(
+                "ap1",
+                ApprovalStatus::Approved,
+                Some("u".into()),
+                "t2".into(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_audit_event(AuditEvent {
+                ts: "t1".into(),
+                decision: "allow".into(),
+                task_id: Some("task1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .append_audit_event(AuditEvent {
+                ts: "t2".into(),
+                decision: "deny".into(),
+                task_id: Some("task1".into()),
+                reason: Some("no".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .record_revocation(RevocationRecord {
+                id: "r1".into(),
+                target_kind: "task".into(),
+                target_id: "task1".into(),
+                reason: Some("bad".into()),
+                revoked_at: "t3".into(),
+                revoked_by: Some("sys".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s1".into(),
+                task_id: Some("task1".into()),
+                source: "broker".into(),
+                labels: vec!["pii".into()],
+                digest: Some("d".into()),
+                created_at: "t4".into(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let second_mig = reopened.migrate().await.unwrap();
+        assert!(
+            second_mig.is_empty(),
+            "migrations must be idempotent on reopen"
+        );
+
+        let rep = reopened.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 2);
+        let evs = reopened.query_audit(AuditQuery::default()).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].prev_hash, evs[0].hash);
+
+        let policy = reopened.get_active_policy().await.unwrap().unwrap();
+        assert_eq!(policy.id, "p1");
+        let task = reopened.get_task("task1").await.unwrap().unwrap();
+        assert!(task.revoked);
+        assert_eq!(task.revocation_reason.as_deref(), Some("bad"));
+        assert_eq!(task.taint_snapshot_id.as_deref(), Some("s1"));
+        let ap = reopened.get_approval("ap1").await.unwrap().unwrap();
+        assert_eq!(ap.status, ApprovalStatus::Approved);
+        assert_eq!(ap.resolver.as_deref(), Some("u"));
+        let revs = reopened
+            .list_revocations(RevocationQuery {
+                target_id: Some("task1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(revs.len(), 1);
+        let snaps = reopened
+            .list_taint_snapshots(TaintSnapshotQuery {
+                task_id: Some("task1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].labels, vec!["pii".to_string()]);
+
+        // idempotency/conflict persists across restart
+        let dup_rev = reopened
+            .record_revocation(RevocationRecord {
+                id: "r1".into(),
+                target_kind: "task".into(),
+                target_id: "task1".into(),
+                reason: Some("bad".into()),
+                revoked_at: "t3".into(),
+                revoked_by: Some("sys".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(dup_rev, StoreError::Conflict(_)));
+        let dup_snap = reopened
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s1".into(),
+                task_id: Some("task1".into()),
+                source: "broker".into(),
+                labels: vec![],
+                digest: None,
+                created_at: "t4".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(dup_snap, StoreError::Conflict(_)));
+        let dup_ap = reopened
+            .create_approval(ApprovalRecord {
+                id: "ap1".into(),
+                task_id: "task1".into(),
+                tool: "echo".into(),
+                args_hash: "h".into(),
+                status: ApprovalStatus::Pending,
+                created_at: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(dup_ap, StoreError::Conflict(_)));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_durable_tamper_detected_fail_closed() {
+        let path = format!(
+            "/tmp/opencode/store-tamper-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        store.connect().await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .append_audit_event(AuditEvent {
+                ts: "t1".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        // Tamper persisted row directly.
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("UPDATE audit_events SET decision = 'tampered' WHERE seq = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(pool);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let err = reopened.verify_audit_chain().await.unwrap_err();
+        assert!(matches!(err, StoreError::Integrity(_)));
+
+        // Fail-open reporting path: return integrity report instead of error.
+        let mut reopened_report = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: false,
+        })
+        .unwrap();
+        reopened_report.connect().await.unwrap();
+        let rep = reopened_report.verify_audit_chain().await.unwrap();
+        assert!(!rep.ok);
+        assert_eq!(rep.message.as_deref(), Some("hash mismatch"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_pragmas_fail_closed_and_restart_safe() {
+        let path = format!(
+            "/tmp/opencode/store-pragmas-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        // fail-closed before connect
+        let err = store
+            .upsert_task(TaskRecord {
+                id: "t1".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 1,
+                expires_at: "x".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unavailable(_)));
+
+        store.connect().await.unwrap();
+        let pool = store.pool().unwrap();
+        let jm: String = sqlx::query_scalar("PRAGMA journal_mode;")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(jm.to_lowercase(), "wal");
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous;")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(sync, 2, "FULL");
+        let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys;")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(fk, 1);
+        let busy: i64 = sqlx::query_scalar("PRAGMA busy_timeout;")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(busy, 5000);
+
+        store.migrate().await.unwrap();
+        store
+            .append_audit_event(AuditEvent {
+                ts: "t1".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let jm2: String = sqlx::query_scalar("PRAGMA journal_mode;")
+            .fetch_one(reopened.pool().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(jm2.to_lowercase(), "wal");
+        let rep = reopened.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 1);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_conflicts_and_idempotency_guards() {
+        let store = setup("conflicts_idempotency").await;
+        store
+            .create_approval(ApprovalRecord {
+                id: "ap1".into(),
+                task_id: "task1".into(),
+                tool: "echo".into(),
+                args_hash: "h".into(),
+                status: ApprovalStatus::Pending,
+                created_at: "t".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let dup = store
+            .create_approval(ApprovalRecord {
+                id: "ap1".into(),
+                task_id: "task1".into(),
+                tool: "echo".into(),
+                args_hash: "h".into(),
+                status: ApprovalStatus::Pending,
+                created_at: "t".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(dup, StoreError::Conflict(_)));
+        let bad = store
+            .resolve_approval("ap1", ApprovalStatus::Pending, None, "t2".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(bad, StoreError::Invalid(_)));
+        store
+            .resolve_approval("ap1", ApprovalStatus::Denied, Some("u".into()), "t2".into())
+            .await
+            .unwrap();
+        let again = store
+            .resolve_approval(
+                "ap1",
+                ApprovalStatus::Approved,
+                Some("u2".into()),
+                "t3".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(again, StoreError::Conflict(_)));
+
+        store
+            .upsert_task(TaskRecord {
+                id: "t1".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 1,
+                expires_at: "x".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let rev = RevocationRecord {
+            id: "r1".into(),
+            target_kind: "task".into(),
+            target_id: "t1".into(),
+            reason: Some("bad".into()),
+            revoked_at: "now".into(),
+            revoked_by: None,
+        };
+        store.record_revocation(rev.clone()).await.unwrap();
+        let dup_rev = store.record_revocation(rev).await.unwrap_err();
+        assert!(matches!(dup_rev, StoreError::Conflict(_)));
+
+        let bad_audit = store
+            .append_audit_event(AuditEvent {
+                ts: "".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_audit, StoreError::Invalid(_)));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_append_before_return_restart_live_proof() {
+        let path = format!(
+            "/tmp/opencode/store-live-proof-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        store.connect().await.unwrap();
+        store.migrate().await.unwrap();
+
+        let e1 = store
+            .append_audit_event(AuditEvent {
+                ts: "t1".into(),
+                decision: "allow".into(),
+                task_id: Some("task-live".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(e1.seq, 1);
+        assert!(e1.prev_hash.is_none());
+        assert!(e1.hash.is_some());
+        let rep = store.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 1);
+        drop(store);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let rep = reopened.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 1);
+        let evs = reopened.query_audit(AuditQuery::default()).await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].hash, e1.hash);
+
+        let e2 = reopened
+            .append_audit_event(AuditEvent {
+                ts: "t2".into(),
+                decision: "deny".into(),
+                task_id: Some("task-live".into()),
+                reason: Some("blocked".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(e2.seq, 2);
+        assert_eq!(e2.prev_hash, e1.hash);
+        let rep = reopened.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 2);
+        drop(reopened);
+
+        let mut reopened2 = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened2.connect().await.unwrap();
+        let rep = reopened2.verify_audit_chain().await.unwrap();
+        assert!(rep.ok && rep.checked_events == 2);
+        let evs = reopened2.query_audit(AuditQuery::default()).await.unwrap();
+        assert_eq!(evs[1].prev_hash, evs[0].hash);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-shm"));

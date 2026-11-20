@@ -22,4 +22,5 @@ hex = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
+proptest = "1"
 tokio.workspace = true

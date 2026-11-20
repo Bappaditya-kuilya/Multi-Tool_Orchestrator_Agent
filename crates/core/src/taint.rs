@@ -133,6 +133,18 @@ impl TaintSummary {
     pub fn is_clean(&self) -> bool {
         self.labels.is_empty()
     }
+
+    /// Convert this summary into a policy context hint for live enforcement hooks.
+    pub fn to_policy_taint_hint(&self) -> Option<crate::policy::TaintHint> {
+        if self.labels.is_empty() {
+            None
+        } else {
+            Some(crate::policy::TaintHint {
+                labels: self.label_names.iter().map(|s| s.to_string()).collect(),
+                sensitive: self.has_untrusted_content || self.has_private_data,
+            })
+        }
+    }
 }
 
 /// A session's accumulated taint state.
@@ -245,6 +257,23 @@ impl SessionTaint {
             has_untrusted_content: self.has_untrusted_content(),
             has_private_data: self.has_private_data(),
             conflicted_for_egress: self.is_conflicted_for_egress(),
+        }
+    }
+
+    /// Convert current taint state into a policy context hint for live enforcement hooks.
+    /// Returns `None` when no taint labels are present, so callers can omit inert hints.
+    pub fn to_policy_taint_hint(&self) -> Option<crate::policy::TaintHint> {
+        if self.labels.is_empty() {
+            None
+        } else {
+            Some(crate::policy::TaintHint {
+                labels: self
+                    .label_names()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                sensitive: self.has_untrusted_content() || self.has_private_data(),
+            })
         }
     }
 
@@ -445,6 +474,17 @@ impl SessionTaint {
 pub trait SessionTaintStore: Send + Sync {
     fn load(&self, session_id: &str) -> Option<SessionTaint>;
     fn save(&self, session_id: &str, taint: &SessionTaint);
+
+    /// Fallible load hook for fail-closed live wiring.
+    fn try_load(&self, session_id: &str) -> Result<Option<SessionTaint>, String> {
+        Ok(self.load(session_id))
+    }
+
+    /// Fallible save hook for fail-closed live wiring.
+    fn try_save(&self, session_id: &str, taint: &SessionTaint) -> Result<(), String> {
+        self.save(session_id, taint);
+        Ok(())
+    }
 }
 
 /// Simple in-memory runtime store for session taint state.
@@ -461,15 +501,58 @@ impl InMemorySessionTaintStore {
 
 impl SessionTaintStore for InMemorySessionTaintStore {
     fn load(&self, session_id: &str) -> Option<SessionTaint> {
-        self.sessions.read().ok()?.get(session_id).cloned()
+        let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
+        sessions.get(session_id).cloned()
     }
 
     fn save(&self, session_id: &str, taint: &SessionTaint) {
-        if let Ok(mut sessions) = self.sessions.write() {
-            sessions.insert(session_id.to_string(), taint.clone());
-        }
+        let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
+        sessions.insert(session_id.to_string(), taint.clone());
+    }
+
+    fn try_load(&self, session_id: &str) -> Result<Option<SessionTaint>, String> {
+        Ok(self.load(session_id))
+    }
+
+    fn try_save(&self, session_id: &str, taint: &SessionTaint) -> Result<(), String> {
+        self.save(session_id, taint);
+        Ok(())
     }
 }
+
+/// Runtime hook for observing taint propagation and enforcement decisions.
+/// Useful for audit/telemetry and fail-closed handling of private→external flows.
+pub trait TaintHook: Send + Sync {
+    /// Called when propagation is applied to a session.
+    fn on_propagation(
+        &self,
+        _session_id: &str,
+        _before: &SessionTaint,
+        _after: &SessionTaint,
+        _model: &PropagationModel,
+    ) {
+    }
+
+    /// Called when an operation/egress decision is evaluated.
+    /// External egress decisions (including conflicted private→external flows)
+    /// are reported with `target.is_external_egress() == true`.
+    fn on_egress_decision(
+        &self,
+        _session_id: &str,
+        _operation: &str,
+        _target: &OperationTarget,
+        _taint: &SessionTaint,
+        _policy: EgressPolicy,
+        _decision: TaintDecision,
+    ) {
+    }
+}
+
+/// No-op taint hook.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopTaintHook;
+
+impl TaintHook for NoopTaintHook {}
 
 /// Runtime taint enforcement API: record propagation and gate operations by policy.
 #[derive(Debug, Clone, Copy, Default)]
@@ -481,6 +564,18 @@ impl TaintEnforcer {
         session.propagate_in(model);
     }
 
+    /// Apply propagation and emit hook observations.
+    pub fn apply_propagation_with_hook<H: TaintHook + ?Sized>(
+        session_id: &str,
+        session: &mut SessionTaint,
+        model: &PropagationModel,
+        hook: &H,
+    ) {
+        let before = session.clone();
+        session.propagate_in(model);
+        hook.on_propagation(session_id, &before, session, model);
+    }
+
     /// Evaluate an operation against current taint with an explicit egress policy.
     pub fn enforce_operation(
         session: &SessionTaint,
@@ -488,6 +583,27 @@ impl TaintEnforcer {
         egress_policy: EgressPolicy,
     ) -> TaintDecision {
         session.evaluate_operation_with(operation, egress_policy)
+    }
+
+    /// Evaluate an operation and emit hook observations.
+    pub fn enforce_operation_with_hook<H: TaintHook + ?Sized>(
+        session_id: &str,
+        session: &SessionTaint,
+        operation: &str,
+        egress_policy: EgressPolicy,
+        hook: &H,
+    ) -> TaintDecision {
+        let target = OperationTarget::from_operation(operation);
+        let decision = session.evaluate_target_with(&target, egress_policy);
+        hook.on_egress_decision(
+            session_id,
+            operation,
+            &target,
+            session,
+            egress_policy,
+            decision,
+        );
+        decision
     }
 
     /// Load session taint, apply propagation, persist, and enforce an operation.
@@ -498,13 +614,79 @@ impl TaintEnforcer {
         operation: &str,
         egress_policy: EgressPolicy,
     ) -> TaintDecision {
-        let mut session = store.load(session_id).unwrap_or_default();
+        Self::apply_and_enforce_with_hook(
+            store,
+            session_id,
+            propagation,
+            operation,
+            egress_policy,
+            &NoopTaintHook,
+        )
+    }
+
+    /// Load session taint, apply propagation, persist, and enforce an operation with hook.
+    /// Best-effort persistence via [`SessionTaintStore`]; use
+    /// [`Self::try_apply_and_enforce_with_hook`] for fail-closed store errors.
+    pub fn apply_and_enforce_with_hook<S: SessionTaintStore + ?Sized, H: TaintHook + ?Sized>(
+        store: &S,
+        session_id: &str,
+        propagation: Option<&PropagationModel>,
+        operation: &str,
+        egress_policy: EgressPolicy,
+        hook: &H,
+    ) -> TaintDecision {
+        Self::try_apply_and_enforce_with_hook(
+            store,
+            session_id,
+            propagation,
+            operation,
+            egress_policy,
+            hook,
+        )
+        .unwrap_or(TaintDecision::Block)
+    }
+
+    /// Fail-closed variant of [`Self::apply_and_enforce`] that propagates store errors.
+    pub fn try_apply_and_enforce<S: SessionTaintStore + ?Sized>(
+        store: &S,
+        session_id: &str,
+        propagation: Option<&PropagationModel>,
+        operation: &str,
+        egress_policy: EgressPolicy,
+    ) -> Result<TaintDecision, String> {
+        Self::try_apply_and_enforce_with_hook(
+            store,
+            session_id,
+            propagation,
+            operation,
+            egress_policy,
+            &NoopTaintHook,
+        )
+    }
+
+    /// Fail-closed load/apply/enforce/save flow that returns store errors instead of
+    /// silently permitting on persistence failure.
+    pub fn try_apply_and_enforce_with_hook<S: SessionTaintStore + ?Sized, H: TaintHook + ?Sized>(
+        store: &S,
+        session_id: &str,
+        propagation: Option<&PropagationModel>,
+        operation: &str,
+        egress_policy: EgressPolicy,
+        hook: &H,
+    ) -> Result<TaintDecision, String> {
+        let mut session = store
+            .try_load(session_id)
+            .map_err(|e| format!("taint store load failed: {e}"))?
+            .unwrap_or_default();
         if let Some(model) = propagation {
-            Self::apply_propagation(&mut session, model);
+            Self::apply_propagation_with_hook(session_id, &mut session, model, hook);
         }
-        let decision = Self::enforce_operation(&session, operation, egress_policy);
-        store.save(session_id, &session);
-        decision
+        let decision =
+            Self::enforce_operation_with_hook(session_id, &session, operation, egress_policy, hook);
+        store
+            .try_save(session_id, &session)
+            .map_err(|e| format!("taint store save failed: {e}"))?;
+        Ok(decision)
     }
 }
 
@@ -704,5 +886,157 @@ mod tests {
 
         let clean = SessionTaint::new();
         assert!(clean.propagate_out(&out_model).is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingTaintHook {
+        propagations: std::sync::Mutex<Vec<String>>,
+        decisions: std::sync::Mutex<Vec<(String, bool, TaintDecision)>>,
+    }
+
+    impl TaintHook for RecordingTaintHook {
+        fn on_propagation(
+            &self,
+            session_id: &str,
+            _before: &SessionTaint,
+            _after: &SessionTaint,
+            model: &PropagationModel,
+        ) {
+            self.propagations.lock().unwrap().push(format!(
+                "{session_id}:{:?}:{}",
+                model.flow,
+                model.source_labels.len()
+            ));
+        }
+
+        fn on_egress_decision(
+            &self,
+            _session_id: &str,
+            operation: &str,
+            target: &OperationTarget,
+            _taint: &SessionTaint,
+            _policy: EgressPolicy,
+            decision: TaintDecision,
+        ) {
+            self.decisions.lock().unwrap().push((
+                operation.to_string(),
+                target.is_external_egress(),
+                decision,
+            ));
+        }
+    }
+
+    #[test]
+    fn enforcer_hooks_observe_propagation_and_private_external_egress_decisions() {
+        let store = InMemorySessionTaintStore::new();
+        let hook = RecordingTaintHook::default();
+        let decision = TaintEnforcer::apply_and_enforce_with_hook(
+            &store,
+            "sess-1",
+            Some(&PropagationModel::input_to_session(vec![
+                TaintLabel::UntrustedContent,
+                TaintLabel::PrivateData,
+            ])),
+            "external_egress",
+            EgressPolicy::RequireApprovalOnConflict,
+            &hook,
+        );
+        assert_eq!(decision, TaintDecision::RequireApproval);
+        assert_eq!(hook.propagations.lock().unwrap().len(), 1);
+        let decisions = hook.decisions.lock().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].0, "external_egress");
+        assert!(decisions[0].1);
+        assert_eq!(decisions[0].2, TaintDecision::RequireApproval);
+        drop(decisions);
+
+        let blocked = TaintEnforcer::enforce_operation_with_hook(
+            "sess-1",
+            &store.load("sess-1").unwrap(),
+            "egress",
+            EgressPolicy::BlockOnConflict,
+            &hook,
+        );
+        assert_eq!(blocked, TaintDecision::Block);
+        assert!(hook.decisions.lock().unwrap().last().unwrap().1);
+    }
+
+    #[test]
+    fn in_memory_store_recovers_poisoned_lock_without_losing_taint() {
+        let store = InMemorySessionTaintStore::new();
+        store.save(
+            "sess-poison",
+            &SessionTaint::new()
+                .with_label(TaintLabel::UntrustedContent)
+                .with_label(TaintLabel::PrivateData),
+        );
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.sessions.write().unwrap();
+            panic!("poison");
+        }));
+        assert!(poisoned.is_err());
+
+        let loaded = store
+            .load("sess-poison")
+            .expect("poison recovery should preserve state");
+        assert!(loaded.is_conflicted_for_egress());
+        store.save(
+            "sess-poison",
+            &loaded.without_label(TaintLabel::PrivateData),
+        );
+        let updated = store.load("sess-poison").unwrap();
+        assert!(!updated.has_private_data());
+    }
+
+    #[derive(Default)]
+    struct FailingSaveStore {
+        inner: InMemorySessionTaintStore,
+    }
+
+    impl SessionTaintStore for FailingSaveStore {
+        fn load(&self, session_id: &str) -> Option<SessionTaint> {
+            self.inner.load(session_id)
+        }
+
+        fn save(&self, session_id: &str, taint: &SessionTaint) {
+            self.inner.save(session_id, taint);
+        }
+
+        fn try_load(&self, session_id: &str) -> Result<Option<SessionTaint>, String> {
+            self.inner.try_load(session_id)
+        }
+
+        fn try_save(&self, _session_id: &str, _taint: &SessionTaint) -> Result<(), String> {
+            Err("disk full".into())
+        }
+    }
+
+    #[test]
+    fn try_apply_and_enforce_fails_closed_on_store_errors() {
+        let store = FailingSaveStore::default();
+        let err = TaintEnforcer::try_apply_and_enforce(
+            &store,
+            "sess-fail",
+            Some(&PropagationModel::input_to_session(vec![
+                TaintLabel::UntrustedContent,
+                TaintLabel::PrivateData,
+            ])),
+            "external_egress",
+            EgressPolicy::RequireApprovalOnConflict,
+        )
+        .unwrap_err();
+        assert!(err.contains("save failed"));
+
+        let blocked = TaintEnforcer::apply_and_enforce(
+            &store,
+            "sess-fail",
+            Some(&PropagationModel::input_to_session(vec![
+                TaintLabel::UntrustedContent,
+                TaintLabel::PrivateData,
+            ])),
+            "external_egress",
+            EgressPolicy::RequireApprovalOnConflict,
+        );
+        assert_eq!(blocked, TaintDecision::Block);
     }
 }

@@ -132,6 +132,28 @@ impl TaintHint {
     pub fn has_label(&self, label: &str) -> bool {
         self.labels.iter().any(|l| l == label)
     }
+
+    /// True when taint is present and should be treated as a live-enforcement signal.
+    pub fn is_active(&self) -> bool {
+        self.sensitive || !self.labels.is_empty()
+    }
+}
+
+/// Argument hints attached to a request (no raw argument payloads).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArgsHint {
+    /// Number of arguments/fields observed.
+    pub count: u32,
+    /// True when any argument is considered sensitive by the caller.
+    pub sensitive: bool,
+    /// Argument keys/paths/shapes observed (best-effort hints).
+    pub keys: Vec<String>,
+}
+
+impl ArgsHint {
+    pub fn has_key(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key)
+    }
 }
 
 /// Request context for policy evaluation.
@@ -147,6 +169,8 @@ pub struct Context {
     pub call_count: Option<CallCountHint>,
     /// Optional taint hint.
     pub taint: Option<TaintHint>,
+    /// Optional argument hints (no raw argument values).
+    pub args: Option<ArgsHint>,
 }
 
 impl Context {
@@ -177,6 +201,11 @@ impl Context {
         self
     }
 
+    pub fn with_args(mut self, args: ArgsHint) -> Self {
+        self.args = Some(args);
+        self
+    }
+
     /// Integration helper: normalize budget/rate/call-count hints in place.
     pub fn normalize_limits(&mut self) {
         if let Some(h) = self.budget.take() {
@@ -200,6 +229,14 @@ impl Context {
 
     pub fn call_count_exceeded(&self) -> bool {
         self.call_count.as_ref().is_some_and(|h| h.is_exceeded())
+    }
+
+    pub fn taint_active(&self) -> bool {
+        self.taint.as_ref().is_some_and(|h| h.is_active())
+    }
+
+    pub fn args_sensitive(&self) -> bool {
+        self.args.as_ref().is_some_and(|h| h.sensitive)
     }
 
     pub fn any_limit_exceeded(&self) -> bool {
@@ -414,6 +451,8 @@ pub struct Rule {
     pub when_tainted: bool,
     /// Optional taint label required for `when_tainted` matches.
     pub taint_label: Option<String>,
+    /// When true, match only if argument hints mark the request as sensitive.
+    pub when_args_sensitive: bool,
 }
 
 impl Rule {
@@ -498,13 +537,13 @@ impl Rule {
         if self.when_tainted {
             let tainted = req.context.taint.as_ref().is_some_and(|h| {
                 let label_ok = self.taint_label.as_ref().is_none_or(|l| h.has_label(l));
-                label_ok && (h.sensitive || !h.labels.is_empty())
+                label_ok && h.is_active()
             });
             if !tainted {
                 return false;
             }
         }
-        true
+        !(self.when_args_sensitive && !req.context.args_sensitive())
     }
 
     fn matches(&self, req: &PolicyRequest) -> bool {
@@ -604,12 +643,21 @@ pub fn context_hooks_detailed(
         }
     }
     if let Some(t) = request.context.taint.as_ref() {
-        if t.sensitive {
+        if t.is_active() {
             let labels = t.labels.clone();
             out.push((
                 PolicyDecision::RequireApproval,
-                PolicyReason::hook("taint_sensitive", "taint sensitive"),
+                PolicyReason::hook("taint_active", "taint present or sensitive"),
                 PolicyObligation::TaintReview { labels },
+            ));
+        }
+    }
+    if let Some(a) = request.context.args.as_ref() {
+        if a.sensitive {
+            out.push((
+                PolicyDecision::RequireApproval,
+                PolicyReason::hook("args_sensitive", "sensitive arguments"),
+                PolicyObligation::require_approval("sensitive arguments require approval"),
             ));
         }
     }
@@ -817,11 +865,477 @@ impl PolicyRequest {
 /// Feature-gated Cedar adapter hooks for runtime policy integrations.
 #[cfg(feature = "cedar")]
 pub mod cedar_adapter {
-    use super::{PolicyEvaluation, PolicyRequest};
+    use super::{
+        context_hooks_detailed, PolicyAuthorizer, PolicyDecision, PolicyEngine, PolicyEvaluation,
+        PolicyObligation, PolicyReason, PolicyRequest,
+    };
+    use cedar_policy::{
+        Authorizer, Context as CedarContext, Decision, Entities, EntityId, EntityTypeName,
+        EntityUid, PolicySet, Request as CedarRequest,
+    };
+    use std::path::Path;
+    use std::str::FromStr;
 
     /// Hook for evaluating requests via a Cedar-backed runtime authorizer.
     pub trait CedarAuthorizer {
         fn authorize_with_cedar(&self, request: &PolicyRequest) -> PolicyEvaluation;
+    }
+
+    /// Cedar-backed policy engine for runtime authorization.
+    ///
+    /// Mapping (schema-less, best-effort):
+    /// - Principal: `Principal::"<principal.id>"`
+    /// - Action:    `Action::"<action.name>"`
+    /// - Resource:  `Resource::"<resource.id>"`
+    /// - Context:   approval/limit/taint hints exposed as booleans, counts/limits,
+    ///   identifiers, and taint label set (`taint_labels`).
+    ///
+    /// Entities are empty. Parse/request-construction/evaluation errors fail closed
+    /// (`Forbid`). When Cedar permits (or marks require-approval), core context hooks
+    /// are merged to fail-closed on exceeded/sensitive hints.
+    #[derive(Debug, Clone)]
+    pub struct CedarPolicyEngine {
+        policy_set: PolicySet,
+    }
+
+    impl CedarPolicyEngine {
+        /// Parse and compile Cedar policy text. Fails if parsing/compilation fails.
+        pub fn new(policy_src: &str) -> Result<Self, String> {
+            Self::compile(policy_src)
+        }
+
+        /// Parse and compile Cedar policy text.
+        pub fn compile(policy_src: &str) -> Result<Self, String> {
+            let policy_set = PolicySet::from_str(policy_src).map_err(|e| e.to_string())?;
+            Ok(Self { policy_set })
+        }
+
+        /// Load Cedar policy text from a file path and compile it.
+        pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+            Self::load_from_path(path)
+        }
+
+        /// Load Cedar policy text from a file path and compile it.
+        pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+            let path = path.as_ref();
+            let src = std::fs::read_to_string(path)
+                .map_err(|e| format!("cedar policy load error ({}): {e}", path.display()))?;
+            Self::compile(&src)
+        }
+
+        /// Wrap an already-compiled Cedar [`PolicySet`].
+        pub fn from_policy_set(policy_set: PolicySet) -> Self {
+            Self { policy_set }
+        }
+
+        /// Access the compiled Cedar policy set.
+        pub fn policy_set(&self) -> &PolicySet {
+            &self.policy_set
+        }
+
+        /// Evaluate a request against compiled Cedar policies with fail-closed semantics.
+        /// Core context hooks (budget/rate/call/taint/args) are merged fail-closed with Cedar results.
+        pub fn evaluate(&self, request: &PolicyRequest) -> PolicyEvaluation {
+            let cedar_request = match map_request(request) {
+                Ok(req) => req,
+                Err(msg) => {
+                    return PolicyEvaluation::new(
+                        PolicyDecision::Forbid,
+                        None,
+                        vec![msg.clone()],
+                        vec![PolicyReason::hook("cedar_request_error", msg)],
+                        vec![PolicyObligation::Audit {
+                            event: "policy.cedar_error".into(),
+                        }],
+                    )
+                }
+            };
+
+            let authorizer = Authorizer::new();
+            let entities = Entities::empty();
+            let response = authorizer.is_authorized(&cedar_request, &self.policy_set, &entities);
+
+            let mut reasons = Vec::new();
+            let mut detailed_reasons = Vec::new();
+            let mut obligations = Vec::new();
+
+            let errors: Vec<String> = response
+                .diagnostics()
+                .errors()
+                .map(|e| e.to_string())
+                .collect();
+            if !errors.is_empty() {
+                for err in errors {
+                    let msg = format!("cedar evaluation error: {err}");
+                    reasons.push(msg.clone());
+                    detailed_reasons.push(PolicyReason::hook("cedar_eval_error", msg));
+                }
+                obligations.push(PolicyObligation::Audit {
+                    event: "policy.cedar_error".into(),
+                });
+                return PolicyEvaluation::new(
+                    PolicyDecision::Forbid,
+                    None,
+                    reasons,
+                    detailed_reasons,
+                    obligations,
+                );
+            }
+
+            for id in response.diagnostics().reason() {
+                reasons.push(format!("cedar reason: {id}"));
+                detailed_reasons.push(PolicyReason::rule(
+                    "cedar_policy",
+                    format!("matched cedar policy {id}"),
+                    Some(id.to_string()),
+                ));
+            }
+
+            let mut decision = match response.decision() {
+                Decision::Allow => PolicyDecision::Permit,
+                Decision::Deny => PolicyDecision::Forbid,
+            };
+
+            if decision == PolicyDecision::Permit
+                && response
+                    .diagnostics()
+                    .reason()
+                    .any(|id| self.is_require_approval_policy(id))
+            {
+                decision = PolicyDecision::RequireApproval;
+                reasons.push("cedar require-approval policy matched".into());
+                detailed_reasons.push(PolicyReason::hook(
+                    "cedar_require_approval",
+                    "cedar permit policy marked require approval",
+                ));
+                obligations.push(PolicyObligation::require_approval(
+                    "cedar permit policy requires approval",
+                ));
+            }
+
+            // Fail-closed runtime integration: merge core context hooks (budget/rate/call/taint/args)
+            // even when Cedar permits, and also when Cedar denies to keep audit/reasons complete.
+            for (hook_decision, reason, obligation) in context_hooks_detailed(request) {
+                match hook_decision {
+                    PolicyDecision::RequireApproval if decision != PolicyDecision::Forbid => {
+                        decision = PolicyDecision::RequireApproval;
+                    }
+                    PolicyDecision::Forbid => {
+                        decision = PolicyDecision::Forbid;
+                    }
+                    PolicyDecision::Permit | PolicyDecision::RequireApproval => {}
+                }
+                reasons.push(reason.message.clone());
+                detailed_reasons.push(reason);
+                obligations.push(obligation);
+            }
+
+            let mut deduped = Vec::new();
+            for o in obligations {
+                if !deduped.contains(&o) {
+                    deduped.push(o);
+                }
+            }
+            obligations = deduped;
+
+            match decision {
+                PolicyDecision::Forbid => {
+                    obligations.retain(|o| {
+                        !matches!(
+                            o,
+                            PolicyObligation::RequireApproval { .. }
+                                | PolicyObligation::TaintReview { .. }
+                        )
+                    });
+                    if !obligations
+                        .iter()
+                        .any(|o| matches!(o, PolicyObligation::Audit { event } if event == "policy.forbid"))
+                    {
+                        obligations.push(PolicyObligation::Audit {
+                            event: "policy.forbid".into(),
+                        });
+                    }
+                }
+                PolicyDecision::RequireApproval | PolicyDecision::Permit => {}
+            }
+
+            let approval = if decision == PolicyDecision::Forbid {
+                None
+            } else {
+                request.context.approval.clone()
+            };
+
+            PolicyEvaluation::new(decision, approval, reasons, detailed_reasons, obligations)
+        }
+
+        fn is_require_approval_policy(&self, id: &cedar_policy::PolicyId) -> bool {
+            let id_str = id.to_string();
+            if id_str.to_ascii_lowercase().contains("require_approval") {
+                return true;
+            }
+            self.policy_set
+                .policy(id)
+                .and_then(|p| p.annotation("decision").or_else(|| p.annotation("effect")))
+                .is_some_and(|v| v.eq_ignore_ascii_case("require_approval"))
+        }
+    }
+
+    impl PolicyEngine for CedarPolicyEngine {
+        fn evaluate(&self, request: &PolicyRequest) -> PolicyEvaluation {
+            CedarPolicyEngine::evaluate(self, request)
+        }
+    }
+
+    impl PolicyAuthorizer for CedarPolicyEngine {
+        fn authorize(&self, request: &PolicyRequest) -> PolicyEvaluation {
+            CedarPolicyEngine::evaluate(self, request)
+        }
+    }
+
+    impl CedarAuthorizer for CedarPolicyEngine {
+        fn authorize_with_cedar(&self, request: &PolicyRequest) -> PolicyEvaluation {
+            CedarPolicyEngine::evaluate(self, request)
+        }
+    }
+
+    /// Map a core [`PolicyRequest`] into a Cedar request (best-effort, schema-less).
+    /// Invalid Cedar entity identifiers or context construction fail closed with a descriptive error.
+    pub fn map_request(request: &PolicyRequest) -> Result<CedarRequest, String> {
+        to_cedar_request(request)
+    }
+
+    fn to_cedar_request(request: &PolicyRequest) -> Result<CedarRequest, String> {
+        let principal_ty = EntityTypeName::from_str("Principal")
+            .map_err(|e| format!("cedar request error: {e}"))?;
+        let action_ty =
+            EntityTypeName::from_str("Action").map_err(|e| format!("cedar request error: {e}"))?;
+        let resource_ty = EntityTypeName::from_str("Resource")
+            .map_err(|e| format!("cedar request error: {e}"))?;
+
+        let principal_id = EntityId::from_str(&request.principal.id)
+            .map_err(|e| format!("cedar request error: principal id: {e}"))?;
+        let action_id = EntityId::from_str(&request.action.name)
+            .map_err(|e| format!("cedar request error: action id: {e}"))?;
+        let resource_id = EntityId::from_str(&request.resource.id)
+            .map_err(|e| format!("cedar request error: resource id: {e}"))?;
+
+        let principal = EntityUid::from_type_name_and_id(principal_ty, principal_id);
+        let action = EntityUid::from_type_name_and_id(action_ty, action_id);
+        let resource = EntityUid::from_type_name_and_id(resource_ty, resource_id);
+        let context = to_cedar_context(request)?;
+
+        CedarRequest::new(principal, action, resource, context, None)
+            .map_err(|e| format!("cedar request error: {e}"))
+    }
+
+    /// Build a Cedar context from core policy hints (additive, schema-less).
+    /// Best-effort compatibility helper: returns an empty context on construction error.
+    /// Runtime evaluation paths use fail-closed fallible mapping instead.
+    pub fn map_context(request: &PolicyRequest) -> CedarContext {
+        try_map_context(request).unwrap_or_else(|_| CedarContext::empty())
+    }
+
+    /// Fallible Cedar context mapping for runtime integrations that need explicit fail-closed errors.
+    pub fn try_map_context(request: &PolicyRequest) -> Result<CedarContext, String> {
+        to_cedar_context(request)
+    }
+
+    fn to_cedar_context(request: &PolicyRequest) -> Result<CedarContext, String> {
+        use cedar_policy::RestrictedExpression;
+
+        let mut pairs: Vec<(String, RestrictedExpression)> = Vec::new();
+
+        pairs.push((
+            "principal_id".to_string(),
+            RestrictedExpression::new_string(request.principal.id.clone()),
+        ));
+        pairs.push((
+            "action_name".to_string(),
+            RestrictedExpression::new_string(request.action.name.clone()),
+        ));
+        pairs.push((
+            "resource_id".to_string(),
+            RestrictedExpression::new_string(request.resource.id.clone()),
+        ));
+
+        let has_approval = request.context.approval.is_some();
+        pairs.push((
+            "has_approval".to_string(),
+            RestrictedExpression::new_bool(has_approval),
+        ));
+        if let Some(a) = request.context.approval.as_ref() {
+            if let Some(by) = a.approved_by.as_ref() {
+                pairs.push((
+                    "approved_by".to_string(),
+                    RestrictedExpression::new_string(by.clone()),
+                ));
+            }
+            if let Some(reason) = a.reason.as_ref() {
+                pairs.push((
+                    "approval_reason".to_string(),
+                    RestrictedExpression::new_string(reason.clone()),
+                ));
+            }
+        }
+
+        let budget_exceeded = request
+            .context
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.is_exceeded());
+        pairs.push((
+            "budget_exceeded".to_string(),
+            RestrictedExpression::new_bool(budget_exceeded),
+        ));
+        if let Some(b) = request.context.budget.as_ref() {
+            pairs.push((
+                "budget_used".to_string(),
+                RestrictedExpression::new_long(b.used as i64),
+            ));
+            pairs.push((
+                "budget_limit".to_string(),
+                RestrictedExpression::new_long(b.limit as i64),
+            ));
+            pairs.push((
+                "budget_remaining".to_string(),
+                RestrictedExpression::new_long(b.remaining() as i64),
+            ));
+        }
+
+        let rate_exceeded = request
+            .context
+            .rate_limit
+            .as_ref()
+            .is_some_and(|r| r.is_exceeded());
+        pairs.push((
+            "rate_limit_exceeded".to_string(),
+            RestrictedExpression::new_bool(rate_exceeded),
+        ));
+        if let Some(r) = request.context.rate_limit.as_ref() {
+            pairs.push((
+                "rate_calls_in_window".to_string(),
+                RestrictedExpression::new_long(r.calls_in_window as i64),
+            ));
+            pairs.push((
+                "rate_limit".to_string(),
+                RestrictedExpression::new_long(r.limit as i64),
+            ));
+            let remaining = r.limit.saturating_sub(r.calls_in_window);
+            pairs.push((
+                "rate_remaining".to_string(),
+                RestrictedExpression::new_long(remaining as i64),
+            ));
+        }
+
+        let call_exceeded = request
+            .context
+            .call_count
+            .as_ref()
+            .is_some_and(|c| c.is_exceeded());
+        pairs.push((
+            "call_count_exceeded".to_string(),
+            RestrictedExpression::new_bool(call_exceeded),
+        ));
+        if let Some(c) = request.context.call_count.as_ref() {
+            pairs.push((
+                "call_count".to_string(),
+                RestrictedExpression::new_long(c.count as i64),
+            ));
+            pairs.push((
+                "call_count_has_limit".to_string(),
+                RestrictedExpression::new_bool(c.limit.is_some()),
+            ));
+            if let Some(limit) = c.limit {
+                pairs.push((
+                    "call_limit".to_string(),
+                    RestrictedExpression::new_long(limit as i64),
+                ));
+                let remaining = limit.saturating_sub(c.count);
+                pairs.push((
+                    "call_count_remaining".to_string(),
+                    RestrictedExpression::new_long(remaining as i64),
+                ));
+            }
+        } else {
+            pairs.push((
+                "call_count_has_limit".to_string(),
+                RestrictedExpression::new_bool(false),
+            ));
+        }
+
+        let taint_sensitive = request.context.taint.as_ref().is_some_and(|t| t.sensitive);
+        let taint_has_labels = request
+            .context
+            .taint
+            .as_ref()
+            .is_some_and(|t| !t.labels.is_empty());
+        pairs.push((
+            "taint_sensitive".to_string(),
+            RestrictedExpression::new_bool(taint_sensitive),
+        ));
+        pairs.push((
+            "taint_present".to_string(),
+            RestrictedExpression::new_bool(taint_has_labels || taint_sensitive),
+        ));
+        if let Some(t) = request.context.taint.as_ref() {
+            let labels = t
+                .labels
+                .iter()
+                .map(|l| RestrictedExpression::new_string(l.clone()))
+                .collect::<Vec<_>>();
+            pairs.push((
+                "taint_label_count".to_string(),
+                RestrictedExpression::new_long(t.labels.len() as i64),
+            ));
+            let set = RestrictedExpression::new_set(labels);
+            pairs.push(("taint_labels".to_string(), set));
+        } else {
+            pairs.push((
+                "taint_label_count".to_string(),
+                RestrictedExpression::new_long(0),
+            ));
+            let empty: Vec<RestrictedExpression> = Vec::new();
+            pairs.push((
+                "taint_labels".to_string(),
+                RestrictedExpression::new_set(empty),
+            ));
+        }
+
+        let (args_present, args_count, args_sensitive, args_keys_vec) =
+            match request.context.args.as_ref() {
+                Some(a) => {
+                    let keys = a
+                        .keys
+                        .iter()
+                        .map(|k| RestrictedExpression::new_string(k.clone()))
+                        .collect::<Vec<_>>();
+                    (true, a.count as i64, a.sensitive, keys)
+                }
+                None => (false, 0_i64, false, Vec::new()),
+            };
+        pairs.push((
+            "args_present".to_string(),
+            RestrictedExpression::new_bool(args_present),
+        ));
+        pairs.push((
+            "args_count".to_string(),
+            RestrictedExpression::new_long(args_count),
+        ));
+        pairs.push((
+            "args_sensitive".to_string(),
+            RestrictedExpression::new_bool(args_sensitive),
+        ));
+        pairs.push((
+            "args_keys".to_string(),
+            RestrictedExpression::new_set(args_keys_vec),
+        ));
+
+        pairs.push((
+            "any_limit_exceeded".to_string(),
+            RestrictedExpression::new_bool(request.context.any_limit_exceeded()),
+        ));
+
+        CedarContext::from_pairs(pairs).map_err(|e| format!("cedar context error: {e}"))
     }
 }
 
@@ -1036,6 +1550,59 @@ mod tests {
     }
 
     #[test]
+    fn taint_labels_without_sensitive_flag_still_require_approval_fail_closed() {
+        let mut request = req("agent", "invoke", "tool");
+        request.context.taint = Some(TaintHint {
+            labels: vec!["untrusted".into()],
+            sensitive: false,
+        });
+        let eval = evaluate(&request, &[]);
+        assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+        assert!(eval
+            .detailed_reasons
+            .iter()
+            .any(|r| r.code == "taint_active"));
+        assert!(eval
+            .obligations
+            .iter()
+            .any(|o| matches!(o, PolicyObligation::TaintReview { labels } if labels == &vec!["untrusted".to_string()])));
+    }
+
+    #[test]
+    fn sensitive_args_require_approval_and_can_be_gated_by_rules() {
+        let mut request = req("agent", "invoke", "tool");
+        request.context.args = Some(ArgsHint {
+            count: 2,
+            sensitive: true,
+            keys: vec!["path".into(), "token".into()],
+        });
+
+        let eval = evaluate(&request, &[]);
+        assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+        assert!(eval
+            .detailed_reasons
+            .iter()
+            .any(|r| r.code == "args_sensitive"));
+        assert!(eval
+            .obligations
+            .iter()
+            .any(|o| matches!(o, PolicyObligation::RequireApproval { reason } if reason.contains("sensitive arguments"))));
+
+        let gated = Rule {
+            when_args_sensitive: true,
+            effect: PolicyDecision::RequireApproval,
+            reason: Some("args review".into()),
+            ..Rule::default()
+        };
+        let eval_gated = evaluate(&request, std::slice::from_ref(&gated));
+        assert_eq!(eval_gated.decision, PolicyDecision::RequireApproval);
+        assert!(eval_gated.reasons.iter().any(|r| r.contains("args review")));
+
+        let clean = req("agent", "invoke", "tool");
+        assert_eq!(evaluate(&clean, &[gated]).decision, PolicyDecision::Forbid);
+    }
+
+    #[test]
     fn rule_can_match_on_exceeded_or_taint_hints() {
         let mut request = req("agent", "deploy", "prod");
         request.context.budget = Some(BudgetHint {
@@ -1188,9 +1755,38 @@ mod tests {
         assert!(!ctx.rate_limit_exceeded());
         assert!(ctx.call_count_exceeded());
         assert!(ctx.any_limit_exceeded());
+        assert!(!ctx.taint_active());
+        assert!(!ctx.args_sensitive());
         ctx.normalize_limits();
         assert!(ctx.budget.as_ref().unwrap().exceeded);
         assert!(ctx.call_count.as_ref().unwrap().exceeded);
+
+        let ctx2 = Context::default()
+            .with_taint(TaintHint {
+                labels: vec!["pii".into()],
+                sensitive: false,
+            })
+            .with_args(ArgsHint {
+                count: 1,
+                sensitive: true,
+                keys: vec!["x".into()],
+            });
+        assert!(ctx2.taint_active());
+        assert!(ctx2.args_sensitive());
+    }
+
+    #[test]
+    fn args_hints_builder_and_helpers() {
+        let ctx = Context::default().with_args(ArgsHint {
+            count: 2,
+            sensitive: true,
+            keys: vec!["path".into(), "token".into()],
+        });
+        let args = ctx.args.as_ref().expect("args hint");
+        assert_eq!(args.count, 2);
+        assert!(args.sensitive);
+        assert!(args.has_key("path"));
+        assert!(!args.has_key("repo"));
     }
 
     #[test]
@@ -1233,6 +1829,11 @@ mod tests {
             labels: vec!["pii".into()],
             sensitive: true,
         });
+        request.context.args = Some(ArgsHint {
+            count: 1,
+            sensitive: true,
+            keys: vec!["token".into()],
+        });
         let hooks = context_hooks_detailed(&request);
         assert!(hooks.iter().any(|(_, r, _)| r.code == "budget_exceeded"));
         assert!(hooks
@@ -1241,12 +1842,16 @@ mod tests {
         assert!(hooks
             .iter()
             .any(|(_, r, _)| r.code == "call_count_exceeded"));
-        assert!(hooks.iter().any(|(_, r, _)| r.code == "taint_sensitive"));
+        assert!(hooks.iter().any(|(_, r, _)| r.code == "taint_active"));
+        assert!(hooks.iter().any(|(_, r, _)| r.code == "args_sensitive"));
         assert!(hooks
             .iter()
             .any(|(_, _, o)| matches!(o, PolicyObligation::TaintReview { .. })));
         let simple = context_hooks(&request);
         assert!(simple.iter().any(|(_, m)| m.contains("budget exceeded")));
+        assert!(simple
+            .iter()
+            .any(|(_, m)| m.contains("sensitive arguments")));
     }
 
     #[test]
@@ -1337,5 +1942,372 @@ mod tests {
         assert_eq!(engine.evaluate(&req).decision, PolicyDecision::Permit);
         assert_eq!(engine.authorize(&req).decision, PolicyDecision::Permit);
         assert_eq!(req.evaluate_with(&engine).decision, PolicyDecision::Permit);
+    }
+
+    #[test]
+    fn dynamic_policy_engine_applies_runtime_context_hooks_fail_closed() {
+        #[derive(Clone)]
+        struct Src(Vec<Rule>);
+        impl super::PolicySource for Src {
+            fn rules(&self) -> Vec<Rule> {
+                self.0.clone()
+            }
+        }
+
+        let engine = super::DynamicPolicyEngine::new(Src(vec![Rule::permit_tool("invoke")]));
+        let mut request = req("agent", "invoke", "tool");
+        request.context.taint = Some(TaintHint {
+            labels: vec!["untrusted".into()],
+            sensitive: false,
+        });
+        request.context.budget = Some(BudgetHint {
+            used: 10,
+            limit: 10,
+            exceeded: false,
+        });
+        let eval = super::PolicyEngine::evaluate(&engine, &request);
+        assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+        assert!(eval
+            .detailed_reasons
+            .iter()
+            .any(|r| r.code == "taint_active"));
+        assert!(eval
+            .detailed_reasons
+            .iter()
+            .any(|r| r.code == "budget_exceeded"));
+
+        let clean = req("agent", "invoke", "tool");
+        assert_eq!(
+            super::PolicyEngine::evaluate(&engine, &clean).decision,
+            PolicyDecision::Permit
+        );
+        assert_eq!(
+            request.evaluate_with_source(&engine.source).decision,
+            PolicyDecision::RequireApproval
+        );
+
+        let forbid_engine = super::DynamicPolicyEngine::new(Src(vec![Rule::forbid_tool("invoke")]));
+        assert_eq!(
+            super::PolicyEngine::evaluate(&forbid_engine, &request).decision,
+            PolicyDecision::Forbid
+        );
+    }
+
+    #[cfg(feature = "cedar")]
+    mod cedar_tests {
+        use super::super::cedar_adapter::{CedarAuthorizer, CedarPolicyEngine};
+        use super::super::{PolicyAuthorizer, PolicyDecision, PolicyEngine, PolicyRequest};
+
+        #[test]
+        fn cedar_permit_forbid_and_default_deny() {
+            let engine = CedarPolicyEngine::new(
+                r#"
+                permit(principal == Principal::"alice", action == Action::"read", resource == Resource::"doc");
+                forbid(principal == Principal::"mallory", action == Action::"read", resource == Resource::"doc");
+                "#,
+            )
+            .expect("parse cedar policies");
+
+            let permit = engine.evaluate(&PolicyRequest::new("alice", "read", "doc"));
+            assert_eq!(permit.decision, PolicyDecision::Permit);
+            assert!(permit.reasons.iter().any(|r| r.contains("cedar reason")));
+
+            let forbid = engine.evaluate(&PolicyRequest::new("mallory", "read", "doc"));
+            assert_eq!(forbid.decision, PolicyDecision::Forbid);
+
+            let deny_default = engine.evaluate(&PolicyRequest::new("bob", "read", "doc"));
+            assert_eq!(deny_default.decision, PolicyDecision::Forbid);
+
+            // trait integration
+            assert_eq!(
+                PolicyEngine::evaluate(&engine, &PolicyRequest::new("alice", "read", "doc"))
+                    .decision,
+                PolicyDecision::Permit
+            );
+            assert_eq!(
+                PolicyAuthorizer::authorize(&engine, &PolicyRequest::new("alice", "read", "doc"))
+                    .decision,
+                PolicyDecision::Permit
+            );
+            assert_eq!(
+                engine
+                    .authorize_with_cedar(&PolicyRequest::new("alice", "read", "doc"))
+                    .decision,
+                PolicyDecision::Permit
+            );
+        }
+
+        #[test]
+        fn cedar_require_approval_by_annotation_marker() {
+            let engine = CedarPolicyEngine::new(
+                r#"
+                @decision("require_approval")
+                permit(principal, action == Action::"deploy", resource);
+                "#,
+            )
+            .expect("parse cedar policies");
+
+            let eval = engine.evaluate(&PolicyRequest::new("alice", "deploy", "prod"));
+            assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+            assert!(eval.requires_approval());
+            assert!(eval
+                .reasons
+                .iter()
+                .any(|r| r.contains("require-approval") || r.contains("require_approval")));
+            assert!(eval
+                .obligations
+                .iter()
+                .any(|o| matches!(o, super::super::PolicyObligation::RequireApproval { .. })));
+        }
+
+        #[test]
+        fn cedar_parse_and_eval_errors_fail_closed() {
+            assert!(CedarPolicyEngine::new("permit(principal, action, resource)").is_err());
+
+            let engine = CedarPolicyEngine::new(
+                r#"
+                permit(principal, action, resource) when { principal.missing_attr == "x" };
+                "#,
+            )
+            .expect("parse simple policy");
+            let eval = engine.evaluate(&PolicyRequest::new("alice", "read", "doc"));
+            assert_eq!(eval.decision, PolicyDecision::Forbid);
+            assert!(eval
+                .detailed_reasons
+                .iter()
+                .any(|r| r.code == "cedar_eval_error" || r.code == "cedar_request_error"));
+        }
+
+        #[test]
+        fn cedar_context_mapping_supports_budget_and_taint_conditions() {
+            let engine = CedarPolicyEngine::new(
+                r#"
+                permit(principal, action == Action::"invoke", resource)
+                when { context.budget_exceeded == false && context.taint_sensitive == false };
+                "#,
+            )
+            .expect("parse cedar policies");
+
+            let allowed = PolicyRequest::new("alice", "invoke", "tool");
+            assert_eq!(engine.evaluate(&allowed).decision, PolicyDecision::Permit);
+
+            let mut blocked_budget = PolicyRequest::new("alice", "invoke", "tool");
+            blocked_budget.context.budget = Some(super::super::BudgetHint {
+                used: 10,
+                limit: 10,
+                exceeded: false,
+            });
+            blocked_budget.context.normalize_limits();
+            assert_eq!(
+                engine.evaluate(&blocked_budget).decision,
+                PolicyDecision::Forbid
+            );
+
+            let mut blocked_taint = PolicyRequest::new("alice", "invoke", "tool");
+            blocked_taint.context.taint = Some(super::super::TaintHint {
+                labels: vec!["untrusted".into()],
+                sensitive: true,
+            });
+            assert_eq!(
+                engine.evaluate(&blocked_taint).decision,
+                PolicyDecision::Forbid
+            );
+        }
+
+        #[test]
+        fn cedar_context_hooks_escalate_permit_to_require_approval_fail_closed() {
+            let engine = CedarPolicyEngine::new("permit(principal, action, resource);")
+                .expect("parse cedar policies");
+
+            let mut req = PolicyRequest::new("alice", "invoke", "tool");
+            req.context.budget = Some(super::super::BudgetHint {
+                used: 5,
+                limit: 5,
+                exceeded: false,
+            });
+            req.context.normalize_limits();
+            let eval = engine.evaluate(&req);
+            assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+            assert!(eval
+                .detailed_reasons
+                .iter()
+                .any(|r| r.code == "budget_exceeded"));
+
+            let mut tainted = PolicyRequest::new("alice", "invoke", "tool");
+            tainted.context.taint = Some(super::super::TaintHint {
+                labels: vec!["pii".into()],
+                sensitive: true,
+            });
+            let eval_tainted = engine.evaluate(&tainted);
+            assert_eq!(eval_tainted.decision, PolicyDecision::RequireApproval);
+            assert!(eval_tainted
+                .obligations
+                .iter()
+                .any(|o| matches!(o, super::super::PolicyObligation::TaintReview { .. })));
+        }
+
+        #[test]
+        fn cedar_maps_additional_context_and_request_helpers() {
+            let engine = CedarPolicyEngine::compile(
+                r#"
+                permit(principal, action == Action::"invoke", resource)
+                when {
+                    context.principal_id == "alice" &&
+                    context.action_name == "invoke" &&
+                    context.resource_id == "tool" &&
+                    context.has_approval == true &&
+                    context.approved_by == "bob" &&
+                    context.approval_reason == "ok" &&
+                    context.budget_used == 3 &&
+                    context.budget_limit == 5 &&
+                    context.budget_remaining == 2 &&
+                    context.budget_exceeded == false &&
+                    context.rate_calls_in_window == 2 &&
+                    context.rate_limit == 3 &&
+                    context.rate_remaining == 1 &&
+                    context.rate_limit_exceeded == false &&
+                    context.call_count == 1 &&
+                    context.call_count_has_limit == true &&
+                    context.call_limit == 2 &&
+                    context.call_count_remaining == 1 &&
+                    context.call_count_exceeded == false &&
+                    context.taint_present == true &&
+                    context.taint_sensitive == false &&
+                    context.taint_label_count == 1 &&
+                    context.any_limit_exceeded == false
+                };
+                "#,
+            )
+            .expect("compile cedar policies");
+
+            let mut req = PolicyRequest::new("alice", "invoke", "tool");
+            req.context.approval = Some(super::super::ApprovalAnnotation {
+                approved_by: Some("bob".into()),
+                reason: Some("ok".into()),
+            });
+            req.context.budget = Some(super::super::BudgetHint {
+                used: 3,
+                limit: 5,
+                exceeded: false,
+            });
+            req.context.rate_limit = Some(super::super::RateLimitHint {
+                calls_in_window: 2,
+                limit: 3,
+                exceeded: false,
+            });
+            req.context.call_count = Some(super::super::CallCountHint {
+                count: 1,
+                limit: Some(2),
+                exceeded: false,
+            });
+            req.context.taint = Some(super::super::TaintHint {
+                labels: vec!["secret".into()],
+                sensitive: false,
+            });
+
+            // Cedar policy permits given mapped context, but core taint hooks fail-closed on
+            // taint label presence and escalate to require approval.
+            let eval = engine.evaluate(&req);
+            assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+            assert!(eval
+                .detailed_reasons
+                .iter()
+                .any(|r| r.code == "taint_active"));
+            assert!(eval
+                .obligations
+                .iter()
+                .any(|o| matches!(o, super::super::PolicyObligation::TaintReview { labels } if labels == &vec!["secret".to_string()])));
+
+            let mapped = super::super::cedar_adapter::map_request(&req);
+            assert!(mapped.is_ok());
+            let _ctx = super::super::cedar_adapter::map_context(&req);
+            let try_ctx = super::super::cedar_adapter::try_map_context(&req);
+            assert!(try_ctx.is_ok());
+        }
+
+        #[test]
+        fn cedar_compile_load_and_policy_set_helpers() {
+            let src = r#"permit(principal, action == Action::"read", resource);"#;
+            let compiled = CedarPolicyEngine::compile(src).expect("compile");
+            let from_set = CedarPolicyEngine::from_policy_set(compiled.policy_set().clone());
+            assert_eq!(
+                from_set
+                    .evaluate(&PolicyRequest::new("a", "read", "r"))
+                    .decision,
+                PolicyDecision::Permit
+            );
+
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "core_cedar_policy_test_{}.cedar",
+                std::process::id()
+            ));
+            std::fs::write(&path, src).expect("write temp cedar policy");
+            let loaded = CedarPolicyEngine::from_path(&path).expect("load from path");
+            assert_eq!(
+                loaded
+                    .evaluate(&PolicyRequest::new("a", "read", "r"))
+                    .decision,
+                PolicyDecision::Permit
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn cedar_request_mapping_helpers_accept_typical_ids() {
+            let engine = CedarPolicyEngine::compile("permit(principal, action, resource);")
+                .expect("compile");
+            let req = PolicyRequest::new("alice", "read", "doc");
+            assert!(super::super::cedar_adapter::map_request(&req).is_ok());
+            let eval = engine.evaluate(&req);
+            assert_eq!(eval.decision, PolicyDecision::Permit);
+        }
+
+        #[test]
+        fn cedar_context_maps_args_hints_and_enforces_conditions() {
+            let engine = CedarPolicyEngine::compile(
+                r#"
+                permit(principal, action == Action::"invoke", resource)
+                when {
+                    context.args_present == true &&
+                    context.args_count == 2 &&
+                    context.args_sensitive == false &&
+                    context.args_keys.contains("path")
+                };
+                "#,
+            )
+            .expect("compile cedar policies");
+
+            let mut allowed = PolicyRequest::new("alice", "invoke", "tool");
+            allowed.context.args = Some(super::super::ArgsHint {
+                count: 2,
+                sensitive: false,
+                keys: vec!["path".into(), "mode".into()],
+            });
+            assert_eq!(engine.evaluate(&allowed).decision, PolicyDecision::Permit);
+
+            let mut sensitive = allowed.clone();
+            sensitive
+                .context
+                .args
+                .as_mut()
+                .expect("args hint")
+                .sensitive = true;
+            assert_eq!(engine.evaluate(&sensitive).decision, PolicyDecision::Forbid);
+
+            let no_args = PolicyRequest::new("alice", "invoke", "tool");
+            assert_eq!(engine.evaluate(&no_args).decision, PolicyDecision::Forbid);
+
+            let ctx = super::super::cedar_adapter::map_context(&no_args);
+            let _ = ctx;
+        }
+
+        #[test]
+        fn cedar_try_map_context_and_map_request_helpers() {
+            let req = PolicyRequest::new("alice", "invoke", "tool");
+            assert!(super::super::cedar_adapter::try_map_context(&req).is_ok());
+            let _ = super::super::cedar_adapter::map_context(&req);
+            assert!(super::super::cedar_adapter::map_request(&req).is_ok());
+        }
     }
 }

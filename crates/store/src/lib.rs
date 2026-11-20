@@ -144,6 +144,19 @@ pub struct AuditEvent {
     pub hash: Option<Vec<u8>>,
 }
 
+impl AuditEvent {
+    /// Validate fields required for append-before-return persistence.
+    pub fn validate_for_append(&self) -> StoreResult<()> {
+        if self.ts.trim().is_empty() {
+            return Err(StoreError::Invalid("audit event ts required".into()));
+        }
+        if self.decision.trim().is_empty() {
+            return Err(StoreError::Invalid("audit event decision required".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuditVerificationReport {
     pub ok: bool,
@@ -166,6 +179,32 @@ pub struct AuditQuery {
     pub to_ts: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
+}
+
+impl AuditQuery {
+    pub fn matches(&self, event: &AuditEvent) -> bool {
+        if let Some(t) = &self.task_id {
+            if event.task_id.as_deref() != Some(t.as_str()) {
+                return false;
+            }
+        }
+        if let Some(d) = &self.decision {
+            if &event.decision != d {
+                return false;
+            }
+        }
+        if let Some(from) = &self.from_ts {
+            if &event.ts < from {
+                return false;
+            }
+        }
+        if let Some(to) = &self.to_ts {
+            if &event.ts > to {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Schema-aligned revocation row.
@@ -200,6 +239,32 @@ pub struct TaskQuery {
     pub limit: Option<u32>,
 }
 
+impl TaskQuery {
+    pub fn matches(&self, task: &TaskRecord) -> bool {
+        if let Some(r) = self.revoked {
+            if task.revoked != r {
+                return false;
+            }
+        }
+        if let Some(p) = &self.parent_id {
+            if task.parent_id.as_deref() != Some(p.as_str()) {
+                return false;
+            }
+        }
+        if let Some(tok) = &self.token_id {
+            if &task.token_id != tok {
+                return false;
+            }
+        }
+        if let Some(snap) = &self.taint_snapshot_id {
+            if task.taint_snapshot_id.as_deref() != Some(snap.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RevocationQuery {
     pub target_kind: Option<String>,
@@ -208,12 +273,68 @@ pub struct RevocationQuery {
     pub limit: Option<u32>,
 }
 
+impl RevocationQuery {
+    pub fn matches(&self, revocation: &RevocationRecord) -> bool {
+        if let Some(k) = &self.target_kind {
+            if &revocation.target_kind != k {
+                return false;
+            }
+        }
+        if let Some(id) = &self.target_id {
+            if &revocation.target_id != id {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaintSnapshotQuery {
     pub task_id: Option<String>,
     pub source: Option<String>,
     pub offset: Option<u32>,
     pub limit: Option<u32>,
+}
+
+impl TaintSnapshotQuery {
+    pub fn matches(&self, snapshot: &TaintSnapshotRecord) -> bool {
+        if let Some(t) = &self.task_id {
+            if snapshot.task_id.as_deref() != Some(t.as_str()) {
+                return false;
+            }
+        }
+        if let Some(src) = &self.source {
+            if &snapshot.source != src {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApprovalQuery {
+    pub task_id: Option<String>,
+    pub status: Option<ApprovalStatus>,
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+impl ApprovalQuery {
+    pub fn matches(&self, approval: &ApprovalRecord) -> bool {
+        if let Some(t) = &self.task_id {
+            if &approval.task_id != t {
+                return false;
+            }
+        }
+        if let Some(s) = &self.status {
+            if &approval.status != s {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Hook placeholders for revocation/taint snapshot side effects.
@@ -243,6 +364,7 @@ pub trait Store: Send + Sync {
     async fn verify_audit_chain(&self) -> StoreResult<AuditVerificationReport>;
     async fn create_approval(&self, approval: ApprovalRecord) -> StoreResult<ApprovalRecord>;
     async fn get_approval(&self, id: &str) -> StoreResult<Option<ApprovalRecord>>;
+    async fn list_approvals(&self, query: ApprovalQuery) -> StoreResult<Vec<ApprovalRecord>>;
     async fn resolve_approval(
         &self,
         id: &str,
@@ -290,6 +412,9 @@ impl Store for UnimplementedStore {
     }
     async fn get_approval(&self, _id: &str) -> StoreResult<Option<ApprovalRecord>> {
         Err(StoreError::NotImplemented("get_approval"))
+    }
+    async fn list_approvals(&self, _query: ApprovalQuery) -> StoreResult<Vec<ApprovalRecord>> {
+        Err(StoreError::NotImplemented("list_approvals"))
     }
     async fn resolve_approval(
         &self,
@@ -369,7 +494,17 @@ pub fn compute_audit_hash(ev: &AuditEvent) -> Vec<u8> {
 /// Reports the first integrity break with diagnostic hashes.
 pub fn verify_audit_chain_events(events: &[AuditEvent]) -> AuditVerificationReport {
     let mut prev: Option<Vec<u8>> = None;
-    for (i, ev) in events.iter().enumerate() {
+    for (expected_seq, (i, ev)) in (1_i64..).zip(events.iter().enumerate()) {
+        if ev.seq != expected_seq {
+            return AuditVerificationReport {
+                ok: false,
+                checked_events: i as u64,
+                first_bad_seq: Some(ev.seq),
+                message: Some("seq mismatch".into()),
+                expected_hash_hex: None,
+                actual_hash_hex: None,
+            };
+        }
         if ev.prev_hash != prev {
             return AuditVerificationReport {
                 ok: false,
@@ -488,6 +623,7 @@ impl Store for InMemoryStore {
     }
 
     async fn append_audit_event(&self, mut event: AuditEvent) -> StoreResult<AuditEvent> {
+        event.validate_for_append()?;
         let mut st = self.lock()?;
         let seq = st.next_seq;
         st.next_seq += 1;
@@ -504,29 +640,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<AuditEvent> = st
             .audit
             .iter()
-            .filter(|e| {
-                if let Some(t) = &query.task_id {
-                    if e.task_id.as_deref() != Some(t.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(d) = &query.decision {
-                    if &e.decision != d {
-                        return false;
-                    }
-                }
-                if let Some(from) = &query.from_ts {
-                    if &e.ts < from {
-                        return false;
-                    }
-                }
-                if let Some(to) = &query.to_ts {
-                    if &e.ts > to {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|e| query.matches(e))
             .cloned()
             .collect();
         let offset = query.offset.unwrap_or(0) as usize;
@@ -576,6 +690,29 @@ impl Store for InMemoryStore {
         Ok(st.approvals.get(id).cloned())
     }
 
+    async fn list_approvals(&self, query: ApprovalQuery) -> StoreResult<Vec<ApprovalRecord>> {
+        let st = self.lock()?;
+        let mut out: Vec<ApprovalRecord> = st
+            .approvals
+            .values()
+            .filter(|a| query.matches(a))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        let offset = query.offset.unwrap_or(0) as usize;
+        if offset > 0 {
+            if offset >= out.len() {
+                out.clear();
+            } else {
+                out.drain(0..offset);
+            }
+        }
+        if let Some(lim) = query.limit {
+            out.truncate(lim as usize);
+        }
+        Ok(out)
+    }
+
     async fn resolve_approval(
         &self,
         id: &str,
@@ -583,6 +720,11 @@ impl Store for InMemoryStore {
         resolver: Option<String>,
         resolved_at: String,
     ) -> StoreResult<ApprovalRecord> {
+        if status == ApprovalStatus::Pending {
+            return Err(StoreError::Invalid(
+                "cannot resolve approval to pending".into(),
+            ));
+        }
         let mut st = self.lock()?;
         let a = st
             .approvals
@@ -616,29 +758,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<TaskRecord> = st
             .tasks
             .values()
-            .filter(|t| {
-                if let Some(r) = query.revoked {
-                    if t.revoked != r {
-                        return false;
-                    }
-                }
-                if let Some(p) = &query.parent_id {
-                    if t.parent_id.as_deref() != Some(p.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(tok) = &query.token_id {
-                    if &t.token_id != tok {
-                        return false;
-                    }
-                }
-                if let Some(snap) = &query.taint_snapshot_id {
-                    if t.taint_snapshot_id.as_deref() != Some(snap.as_str()) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|t| query.matches(t))
             .cloned()
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -686,8 +806,23 @@ impl Store for InMemoryStore {
                 "revocation id/target_kind/target_id required".into(),
             ));
         }
+        {
+            let st = self.lock()?;
+            if st.revocations.contains_key(&record.id) {
+                return Err(StoreError::Conflict(format!(
+                    "revocation {} exists",
+                    record.id
+                )));
+            }
+        }
         self.revocation_hook.on_revocation(&record)?;
         let mut st = self.lock()?;
+        if st.revocations.contains_key(&record.id) {
+            return Err(StoreError::Conflict(format!(
+                "revocation {} exists",
+                record.id
+            )));
+        }
         st.revocations.insert(record.id.clone(), record.clone());
         if record.target_kind == "task" {
             if let Some(task) = st.tasks.get_mut(&record.target_id) {
@@ -703,19 +838,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<RevocationRecord> = st
             .revocations
             .values()
-            .filter(|r| {
-                if let Some(k) = &query.target_kind {
-                    if &r.target_kind != k {
-                        return false;
-                    }
-                }
-                if let Some(id) = &query.target_id {
-                    if &r.target_id != id {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|r| query.matches(r))
             .cloned()
             .collect();
         out.sort_by(|a, b| a.revoked_at.cmp(&b.revoked_at).then(a.id.cmp(&b.id)));
@@ -742,14 +865,44 @@ impl Store for InMemoryStore {
                 "taint snapshot id/source required".into(),
             ));
         }
+        {
+            let st = self.lock()?;
+            if st.taint_snapshots.contains_key(&snapshot.id) {
+                return Err(StoreError::Conflict(format!(
+                    "taint snapshot {} exists",
+                    snapshot.id
+                )));
+            }
+        }
         self.taint_snapshot_hook.on_snapshot(&snapshot)?;
         let mut st = self.lock()?;
+        if st.taint_snapshots.contains_key(&snapshot.id) {
+            return Err(StoreError::Conflict(format!(
+                "taint snapshot {} exists",
+                snapshot.id
+            )));
+        }
         st.taint_snapshots
             .insert(snapshot.id.clone(), snapshot.clone());
         if let Some(task_id) = &snapshot.task_id {
-            if let Some(task) = st.tasks.get_mut(task_id) {
-                // Integrate: link latest-known snapshot id to task record.
-                task.taint_snapshot_id = Some(snapshot.id.clone());
+            let should_link = match st.tasks.get(task_id) {
+                None => false,
+                Some(task) => match task.taint_snapshot_id.as_ref() {
+                    None => true,
+                    Some(cur_id) => st
+                        .taint_snapshots
+                        .get(cur_id)
+                        .map(|cur| {
+                            (snapshot.created_at.as_str(), snapshot.id.as_str())
+                                >= (cur.created_at.as_str(), cur.id.as_str())
+                        })
+                        .unwrap_or(true),
+                },
+            };
+            if should_link {
+                if let Some(task) = st.tasks.get_mut(task_id) {
+                    task.taint_snapshot_id = Some(snapshot.id.clone());
+                }
             }
         }
         Ok(snapshot)
@@ -763,19 +916,7 @@ impl Store for InMemoryStore {
         let mut out: Vec<TaintSnapshotRecord> = st
             .taint_snapshots
             .values()
-            .filter(|s| {
-                if let Some(t) = &query.task_id {
-                    if s.task_id.as_deref() != Some(t.as_str()) {
-                        return false;
-                    }
-                }
-                if let Some(src) = &query.source {
-                    if &s.source != src {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|s| query.matches(s))
             .cloned()
             .collect();
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
@@ -887,6 +1028,63 @@ mod tests {
             .resolve_approval("ap1", ApprovalStatus::Denied, None, "t3".into())
             .await;
         assert!(matches!(conflict, Err(StoreError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn list_approvals_filters_and_paginates() {
+        let store = InMemoryStore::default();
+        for (id, task_id, status, created_at) in [
+            ("a1", "task-a", ApprovalStatus::Pending, "2026-01-01"),
+            ("a2", "task-a", ApprovalStatus::Approved, "2026-01-02"),
+            ("a3", "task-b", ApprovalStatus::Pending, "2026-01-03"),
+        ] {
+            let mut rec = ApprovalRecord {
+                id: id.into(),
+                task_id: task_id.into(),
+                tool: "tool".into(),
+                args_hash: "h".into(),
+                status,
+                created_at: created_at.into(),
+                ..Default::default()
+            };
+            if status != ApprovalStatus::Pending {
+                rec.resolved_at = Some("2026-01-04".into());
+            }
+            store.create_approval(rec).await.unwrap();
+        }
+        let task_a = store
+            .list_approvals(ApprovalQuery {
+                task_id: Some("task-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            task_a.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "a2"]
+        );
+        let pending = store
+            .list_approvals(ApprovalQuery {
+                status: Some(ApprovalStatus::Pending),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "a3"]
+        );
+        let page = store
+            .list_approvals(ApprovalQuery {
+                status: Some(ApprovalStatus::Pending),
+                offset: Some(1),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "a3");
     }
 
     #[tokio::test]
@@ -1201,22 +1399,84 @@ mod tests {
     }
 
     #[test]
+    fn verify_helper_detects_seq_gap() {
+        let e1 = AuditEvent {
+            seq: 1,
+            ts: "t1".into(),
+            decision: "allow".into(),
+            ..Default::default()
+        };
+        let e1 = AuditEvent {
+            hash: Some(compute_audit_hash(&e1)),
+            ..e1
+        };
+        let mut e3 = AuditEvent {
+            seq: 3,
+            ts: "t3".into(),
+            decision: "deny".into(),
+            prev_hash: e1.hash.clone(),
+            ..Default::default()
+        };
+        e3.hash = Some(compute_audit_hash(&e3));
+        let rep = verify_audit_chain_events(&[e1, e3]);
+        assert!(!rep.ok);
+        assert_eq!(rep.message.as_deref(), Some("seq mismatch"));
+        assert_eq!(rep.first_bad_seq, Some(3));
+    }
+
+    #[tokio::test]
+    async fn append_audit_rejects_missing_core_fields() {
+        let store = InMemoryStore::default();
+        let err = store
+            .append_audit_event(AuditEvent {
+                ts: "".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+        let err = store
+            .append_audit_event(AuditEvent {
+                ts: "t".into(),
+                decision: "   ".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+    }
+
+    #[test]
     fn migrations_and_durable_helpers_exposed() {
         let sqlite = migrations_for(BackendKind::SqliteWal).unwrap();
         let pg = migrations_for(BackendKind::Postgres).unwrap();
         assert_eq!(sqlite[0].version, 1);
         assert_eq!(pg[0].name, "001_init");
-        let plan = AuditAppendPlan {
-            event: AuditEvent {
+        let plan = AuditAppendPlan::for_tail(
+            AuditEvent {
                 ts: "t".into(),
                 decision: "allow".into(),
                 ..Default::default()
             },
-            expected_prev_hash: None,
-        };
+            None,
+        );
         let ev = plan.materialize(1, None).unwrap();
         assert_eq!(ev.prev_hash, None);
         assert!(ev.hash.is_some());
+
+        let drift = AuditAppendPlan::for_tail(
+            AuditEvent {
+                ts: "t".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            },
+            Some(vec![1]),
+        );
+        assert!(matches!(
+            drift.materialize(2, Some(vec![2])),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[tokio::test]
@@ -1254,5 +1514,108 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(bad, StoreError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rejects_pending_target() {
+        let store = InMemoryStore::default();
+        store
+            .create_approval(ApprovalRecord {
+                id: "ap1".into(),
+                task_id: "task1".into(),
+                tool: "echo".into(),
+                args_hash: "h".into(),
+                status: ApprovalStatus::Pending,
+                created_at: "t".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let err = store
+            .resolve_approval("ap1", ApprovalStatus::Pending, None, "t2".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn record_revocation_duplicate_conflicts() {
+        let store = InMemoryStore::default();
+        store
+            .upsert_task(TaskRecord {
+                id: "t1".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 1,
+                expires_at: "later".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let rec = RevocationRecord {
+            id: "r1".into(),
+            target_kind: "task".into(),
+            target_id: "t1".into(),
+            reason: Some("bad".into()),
+            revoked_at: "now".into(),
+            revoked_by: None,
+        };
+        store.record_revocation(rec.clone()).await.unwrap();
+        let err = store.record_revocation(rec).await.unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn taint_snapshot_duplicate_and_out_of_order_linking() {
+        let store = InMemoryStore::default();
+        store
+            .upsert_task(TaskRecord {
+                id: "t2".into(),
+                token_id: "tok".into(),
+                scopes: "[]".into(),
+                budget: 1,
+                expires_at: "later".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-new".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec!["new".into()],
+                digest: None,
+                created_at: "2026-01-02".into(),
+            })
+            .await
+            .unwrap();
+        // Out-of-order older snapshot must not regress task linkage.
+        store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-old".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec!["old".into()],
+                digest: None,
+                created_at: "2026-01-01".into(),
+            })
+            .await
+            .unwrap();
+        let task = store.get_task("t2").await.unwrap().unwrap();
+        assert_eq!(task.taint_snapshot_id.as_deref(), Some("s-new"));
+
+        let err = store
+            .record_taint_snapshot(TaintSnapshotRecord {
+                id: "s-new".into(),
+                task_id: Some("t2".into()),
+                source: "broker".into(),
+                labels: vec![],
+                digest: None,
+                created_at: "2026-01-02".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
     }
 }
