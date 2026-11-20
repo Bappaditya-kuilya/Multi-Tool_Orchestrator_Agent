@@ -10,6 +10,8 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 #[cfg(feature = "tokio-runtime")]
@@ -339,7 +341,7 @@ impl<T: AsyncDispatcher + ?Sized> AsyncRequestForwarder for T {
 }
 
 /// Session abstraction for a real upstream MCP client (future `rmcp` adapter target).
-pub trait McpClientSession: Send {
+pub trait McpClientSession: Send + Sync {
     fn is_ready(&self) -> bool;
     fn ping(&mut self) -> Result<(), PoolError> {
         if self.is_ready() {
@@ -353,7 +355,7 @@ pub trait McpClientSession: Send {
 
 /// Async-ready session seam for `rmcp` client wrappers.
 #[async_trait]
-pub trait AsyncMcpClientSession: Send {
+pub trait AsyncMcpClientSession: Send + Sync {
     async fn is_ready(&self) -> bool;
     async fn ping(&mut self) -> Result<(), PoolError> {
         if self.is_ready().await {
@@ -798,6 +800,336 @@ impl<S: McpClientSession> Dispatcher for SessionDispatcher<S> {
     }
 }
 
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c <= '\u{1F}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn find_json_value_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    match bytes[i] {
+        b'"' => {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = i.saturating_add(2),
+                    b'"' => return Some(i + 1),
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b'{' | b'[' => {
+            let mut stack: Vec<u8> = vec![bytes[i]];
+            i += 1;
+            let mut in_str = false;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if in_str {
+                    match b {
+                        b'\\' => i = i.saturating_add(2),
+                        b'"' => {
+                            in_str = false;
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                    continue;
+                }
+                match b {
+                    b'"' => {
+                        in_str = true;
+                        i += 1;
+                    }
+                    b'{' | b'[' => {
+                        stack.push(b);
+                        i += 1;
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            return None;
+                        }
+                        i += 1;
+                        if stack.is_empty() {
+                            return Some(i);
+                        }
+                    }
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            return None;
+                        }
+                        i += 1;
+                        if stack.is_empty() {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        b't' if s[i..].starts_with("true") => Some(i + 4),
+        b'f' if s[i..].starts_with("false") => Some(i + 5),
+        b'n' if s[i..].starts_with("null") => Some(i + 4),
+        b'-' | b'0'..=b'9' => {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E' => i += 1,
+                    _ => break,
+                }
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+fn extract_json_field_value(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut search = json;
+    let mut offset = 0usize;
+    while let Some(pos) = search.find(&needle) {
+        let abs = offset + pos;
+        let after_key = &json[abs + needle.len()..];
+        let trimmed = after_key.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(':') {
+            let rest_trimmed = rest.trim_start();
+            let end = find_json_value_end(rest_trimmed)?;
+            return Some(rest_trimmed[..end].to_string());
+        }
+        offset = abs + needle.len();
+        if offset >= json.len() {
+            break;
+        }
+        search = &json[offset..];
+    }
+    None
+}
+
+fn extract_json_result_or_error(json: &str) -> Result<String, PoolError> {
+    if let Some(err_val) = extract_json_field_value(json, "error") {
+        if err_val != "null" {
+            return Err(PoolError::DispatchFailed(format!(
+                "upstream error: {}",
+                err_val
+            )));
+        }
+    }
+    if let Some(result) = extract_json_field_value(json, "result") {
+        return Ok(result);
+    }
+    Ok(json.trim().to_string())
+}
+
+fn build_stdio_request_line(request: &ForwardRequest, id: i64) -> Result<String, PoolError> {
+    let payload = request.payload.trim();
+    if payload.starts_with('{') {
+        // Preserve caller-provided envelope when present; ensure jsonrpc/id/method minimally.
+        if payload.contains("\"jsonrpc\"")
+            || payload.contains("\"method\"")
+            || payload.contains("\"id\"")
+        {
+            let mut out = payload.to_string();
+            if !out.contains("\"jsonrpc\"") {
+                out.insert_str(1, "\"jsonrpc\":\"2.0\",");
+            }
+            if !out.contains("\"id\"") {
+                out.insert_str(1, &format!("\"id\":{id},"));
+            }
+            if !out.contains("\"method\"") {
+                out.insert_str(
+                    1,
+                    &format!("\"method\":{},", json_escape_string(&request.method)),
+                );
+            }
+            return Ok(out);
+        }
+        // Treat JSON object payload as params object.
+        return Ok(format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":{},\"params\":{}}}",
+            json_escape_string(&request.method),
+            payload
+        ));
+    }
+    if payload.is_empty() || payload == "null" {
+        return Ok(format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":{},\"params\":{{}}}}",
+            json_escape_string(&request.method)
+        ));
+    }
+    // Non-object payload -> params as JSON string value.
+    Ok(format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":{},\"params\":{}}}",
+        json_escape_string(&request.method),
+        json_escape_string(&request.payload)
+    ))
+}
+
+/// Blocking stdio subprocess MCP session (line-delimited JSON-RPC) for sync pool/gateway paths.
+struct StdioInner {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: i64,
+    ready: bool,
+}
+
+pub struct StdioProcessSession {
+    upstream: UpstreamId,
+    inner: std::sync::Mutex<StdioInner>,
+}
+
+impl fmt::Debug for StdioProcessSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ready = self.inner.lock().map(|g| g.ready).unwrap_or(false);
+        f.debug_struct("StdioProcessSession")
+            .field("upstream", &self.upstream)
+            .field("ready", &ready)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StdioProcessSession {
+    pub fn spawn(server: &UpstreamServerConfig) -> Result<Self, PoolError> {
+        let spec = match &server.transport_spec {
+            TransportSpec::Stdio(s) => s,
+            _ => {
+                return Err(PoolError::Unavailable(
+                    "stdio transport spec required".into(),
+                ))
+            }
+        };
+        if spec.program.trim().is_empty() {
+            return Err(PoolError::Unavailable(
+                "stdio program must be non-empty".into(),
+            ));
+        }
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| PoolError::Unavailable(format!("spawn failed: {e}")))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PoolError::Unavailable("missing stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PoolError::Unavailable("missing stdout".into()))?;
+        Ok(Self {
+            upstream: server.id.clone(),
+            inner: std::sync::Mutex::new(StdioInner {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+                ready: true,
+            }),
+        })
+    }
+}
+
+impl Drop for StdioProcessSession {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.child.kill();
+            let _ = inner.child.wait();
+        }
+    }
+}
+
+impl McpClientSession for StdioProcessSession {
+    fn is_ready(&self) -> bool {
+        self.inner.lock().map(|g| g.ready).unwrap_or(false)
+    }
+
+    fn ping(&mut self) -> Result<(), PoolError> {
+        if self.is_ready() {
+            Ok(())
+        } else {
+            Err(PoolError::Unavailable(format!(
+                "session not ready for {}",
+                self.upstream.0
+            )))
+        }
+    }
+
+    fn forward(&mut self, request: &ForwardRequest) -> Result<ForwardResponse, PoolError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PoolError::Unavailable("session lock poisoned".into()))?;
+        if !inner.ready {
+            return Err(PoolError::Unavailable("session not connected".into()));
+        }
+        let id = inner.next_id;
+        inner.next_id = inner.next_id.saturating_add(1);
+        let line = build_stdio_request_line(request, id)?;
+        writeln!(inner.stdin, "{line}").map_err(|e| {
+            inner.ready = false;
+            PoolError::DispatchFailed(format!("stdin write: {e}"))
+        })?;
+        inner.stdin.flush().map_err(|e| {
+            inner.ready = false;
+            PoolError::DispatchFailed(format!("stdin flush: {e}"))
+        })?;
+        let mut out = String::new();
+        let n = inner.stdout.read_line(&mut out).map_err(|e| {
+            inner.ready = false;
+            PoolError::DispatchFailed(format!("stdout read: {e}"))
+        })?;
+        if n == 0 {
+            inner.ready = false;
+            return Err(PoolError::Unavailable("stdio closed".into()));
+        }
+        let payload = extract_json_result_or_error(&out)?;
+        Ok(ForwardResponse { payload })
+    }
+}
+
+/// Blocking stdio connection manager for real subprocess-backed upstream sessions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdioConnectionManager;
+
+impl ConnectionManager for StdioConnectionManager {
+    type Session = StdioProcessSession;
+
+    fn connect(&mut self, server: &UpstreamServerConfig) -> Result<Self::Session, PoolError> {
+        StdioProcessSession::spawn(server)
+    }
+}
+
 /// Placeholder connection manager for std-only/test wiring.
 /// Replace with an `rmcp` transport/session factory in integration.
 #[derive(Debug, Default, Clone, Copy)]
@@ -935,7 +1267,6 @@ where
     upstreams.into_iter().next().cloned()
 }
 
-#[derive(Debug, Clone)]
 struct UpstreamSlot {
     server: UpstreamServerConfig,
     config: UpstreamConfig,
@@ -944,6 +1275,28 @@ struct UpstreamSlot {
     breaker: CircuitBreaker,
     active_leases: usize,
     next_lease_id: u64,
+    circuit_opened_at: Option<std::time::Instant>,
+    /// Managed upstream session for direct sync dispatch (e.g. stdio subprocess).
+    session: Option<Box<dyn McpClientSession + Send + Sync>>,
+}
+
+impl fmt::Debug for UpstreamSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpstreamSlot")
+            .field("server", &self.server)
+            .field("config", &self.config)
+            .field("state", &self.state)
+            .field("connection", &self.connection)
+            .field("breaker", &self.breaker)
+            .field("active_leases", &self.active_leases)
+            .field("next_lease_id", &self.next_lease_id)
+            .field("circuit_opened_at", &self.circuit_opened_at)
+            .field(
+                "session_ready",
+                &self.session.as_ref().map(|s| s.is_ready()),
+            )
+            .finish()
+    }
 }
 
 impl UpstreamSlot {
@@ -962,20 +1315,72 @@ impl UpstreamSlot {
             connection,
             active_leases: 0,
             next_lease_id: 1,
+            circuit_opened_at: None,
+            session: None,
         }
     }
 
     fn max_leases(&self) -> usize {
         self.config.effective_max_leases()
     }
+
+    fn maybe_half_open_after_cooldown(&mut self) {
+        if self.breaker.state != CircuitState::Open {
+            self.circuit_opened_at = None;
+            return;
+        }
+        let cooldown = self.breaker.policy.open_cooldown;
+        let Some(at) = self.circuit_opened_at else {
+            // No recorded open time (e.g. synthetic/manual state): stay fail-closed.
+            return;
+        };
+        if cooldown.is_zero() || at.elapsed() >= cooldown {
+            self.breaker.enter_half_open();
+            self.circuit_opened_at = None;
+        }
+    }
+
+    fn record_breaker_failure(&mut self) {
+        self.breaker.record_failure();
+        if self.breaker.state == CircuitState::Open {
+            self.circuit_opened_at = Some(std::time::Instant::now());
+        }
+    }
+
+    fn record_breaker_success(&mut self) {
+        self.breaker.record_success();
+        if self.breaker.state != CircuitState::Open {
+            self.circuit_opened_at = None;
+        }
+    }
 }
 
 /// Multi-upstream MCP client pool.
-#[derive(Debug, Clone)]
 pub struct McpPool<H = PlaceholderHealthCheck> {
     upstreams: HashMap<UpstreamId, UpstreamSlot>,
     health_check: H,
     default_config: UpstreamConfig,
+}
+
+impl<H: fmt::Debug> fmt::Debug for McpPool<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpPool")
+            .field("upstreams", &self.upstreams)
+            .field("health_check", &self.health_check)
+            .field("default_config", &self.default_config)
+            .finish()
+    }
+}
+
+/// Manual clone for compatibility. Live managed sessions are not cloned.
+impl<H: Clone> Clone for McpPool<H> {
+    fn clone(&self) -> Self {
+        Self {
+            upstreams: HashMap::new(),
+            health_check: self.health_check.clone(),
+            default_config: self.default_config,
+        }
+    }
 }
 
 impl Default for McpPool<PlaceholderHealthCheck> {
@@ -1019,37 +1424,67 @@ impl<H> McpPool<H> {
             .insert(server.id.clone(), UpstreamSlot::new(server, config));
     }
 
-    /// Connection lifecycle placeholder: transition to connected.
+    /// Connection lifecycle: establish a real upstream session when possible (stdio),
+    /// otherwise fall back to connected placeholder state for compatibility.
     pub fn connect(&mut self, upstream: &UpstreamId) -> Result<(), PoolError> {
         let slot = self
             .upstreams
             .get_mut(upstream)
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
         slot.state = ConnectionState::Connecting;
-        // TODO(rmcp): establish real transport/session handshake.
-        slot.state = ConnectionState::Connected;
-        slot.connection.healthy = true;
-        Ok(())
+        slot.session = None;
+        match (&slot.server.transport, &slot.server.transport_spec) {
+            (TransportKind::Stdio, TransportSpec::Stdio(_)) => {
+                let server = slot.server.clone();
+                match StdioProcessSession::spawn(&server) {
+                    Ok(mut session) => {
+                        if let Err(e) = session.ping() {
+                            slot.state = ConnectionState::Unhealthy;
+                            slot.connection.healthy = false;
+                            return Err(e);
+                        }
+                        slot.session = Some(Box::new(session));
+                        slot.state = ConnectionState::Connected;
+                        slot.connection.healthy = true;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        slot.state = ConnectionState::Unhealthy;
+                        slot.connection.healthy = false;
+                        Err(e)
+                    }
+                }
+            }
+            _ => {
+                // Non-stdio sync transports: placeholder connected state; dispatch must use
+                // a provided/managed session dispatcher seam (or runtime async path).
+                slot.state = ConnectionState::Connected;
+                slot.connection.healthy = true;
+                Ok(())
+            }
+        }
     }
 
-    /// Connection lifecycle placeholder: disconnect and mark unhealthy.
+    /// Connection lifecycle: disconnect and drop any managed session.
     pub fn disconnect(&mut self, upstream: &UpstreamId) -> Result<(), PoolError> {
         let slot = self
             .upstreams
             .get_mut(upstream)
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
+        slot.session = None;
         slot.state = ConnectionState::Disconnected;
         slot.connection.healthy = false;
         Ok(())
     }
 
-    /// Connection lifecycle placeholder: reconnect by cycling through connect.
+    /// Connection lifecycle: reconnect by cycling through connect.
     pub fn reconnect(&mut self, upstream: &UpstreamId) -> Result<(), PoolError> {
         self.disconnect(upstream)?;
         self.connect(upstream)
     }
 
     /// Integration hook: connect using a `ConnectionManager`/session factory seam.
+    /// The returned session is caller-managed for compatibility; pool state/health are updated.
     pub fn connect_with_manager<M: ConnectionManager>(
         &mut self,
         upstream: &UpstreamId,
@@ -1060,6 +1495,7 @@ impl<H> McpPool<H> {
             .get_mut(upstream)
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
         slot.state = ConnectionState::Connecting;
+        slot.session = None;
         let mut session = manager.connect(&slot.server)?;
         session.ping().inspect_err(|_| {
             slot.state = ConnectionState::Unhealthy;
@@ -1092,6 +1528,7 @@ impl<H> McpPool<H> {
             .upstreams
             .get_mut(upstream)
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
+        slot.maybe_half_open_after_cooldown();
         let status = self.health_check.check(&slot.connection);
         match status {
             HealthStatus::Healthy => {
@@ -1102,12 +1539,13 @@ impl<H> McpPool<H> {
                 ) {
                     slot.state = ConnectionState::Connected;
                 }
-                slot.breaker.record_success();
+                slot.record_breaker_success();
             }
             HealthStatus::Unhealthy => {
                 slot.connection.healthy = false;
                 slot.state = ConnectionState::Unhealthy;
-                slot.breaker.record_failure();
+                slot.session = None;
+                slot.record_breaker_failure();
             }
         }
         Ok(status)
@@ -1183,6 +1621,7 @@ impl<H: HealthCheck> McpPool<H> {
             .get_mut(upstream)
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
 
+        slot.maybe_half_open_after_cooldown();
         if !slot.breaker.allow_request() {
             return Err(PoolError::CircuitOpen(
                 "requests blocked by circuit breaker".into(),
@@ -1193,7 +1632,8 @@ impl<H: HealthCheck> McpPool<H> {
         }
         let cap = slot.max_leases();
         if slot.active_leases >= cap {
-            // shortcut: no wait queue/timer in std-only skeleton; timeout==0 means fail fast.
+            // std-only sync path has no wait queue/timers: fail closed immediately.
+            // timeout==0 preserves Exhausted semantics; nonzero reports Timeout policy.
             if timeout.is_zero() {
                 return Err(PoolError::Exhausted { max_leases: cap });
             }
@@ -1203,7 +1643,7 @@ impl<H: HealthCheck> McpPool<H> {
 
         match self.health_check.check(&slot.connection) {
             HealthStatus::Healthy => {
-                slot.breaker.record_success();
+                slot.record_breaker_success();
                 let lease = PooledLease {
                     upstream: slot.connection.upstream.clone(),
                     lease_id: slot.next_lease_id,
@@ -1213,7 +1653,7 @@ impl<H: HealthCheck> McpPool<H> {
                 Ok(lease)
             }
             HealthStatus::Unhealthy => {
-                slot.breaker.record_failure();
+                slot.record_breaker_failure();
                 slot.state = ConnectionState::Unhealthy;
                 slot.connection.healthy = false;
                 Err(PoolError::Unavailable("health check failed".into()))
@@ -1242,18 +1682,49 @@ impl<H: HealthCheck> McpPool<H> {
             .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
         slot.state = ConnectionState::Unhealthy;
         slot.connection.healthy = false;
-        slot.breaker.record_failure();
+        slot.session = None;
+        slot.record_breaker_failure();
         Ok(())
     }
 
-    /// Dispatch/forward a request through acquire/release with retry/timeout placeholders.
+    fn has_managed_session(&self, upstream: &UpstreamId) -> bool {
+        self.upstreams
+            .get(upstream)
+            .and_then(|s| s.session.as_ref())
+            .is_some()
+    }
+
+    fn forward_via_managed_session(
+        &mut self,
+        upstream: &UpstreamId,
+        request: &CallRequest,
+    ) -> Result<CallResponse, PoolError> {
+        let slot = self
+            .upstreams
+            .get_mut(upstream)
+            .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
+        let Some(session) = slot.session.as_mut() else {
+            return Err(PoolError::Unavailable(
+                "managed upstream session unavailable".into(),
+            ));
+        };
+        session.forward(request)
+    }
+
+    /// Dispatch/forward a request through acquire/release with retry/backoff in sync paths.
+    ///
+    /// Uses a pool-managed upstream session when present (enabling real stdio upstream calls
+    /// from gateway S1 path), otherwise falls back to the provided dispatcher for compatibility.
+    /// Attempts best-effort connection recovery for disconnected/unhealthy upstreams.
+    /// Call timeout is consulted from config but cannot be enforced preemptively for
+    /// blocking synchronous dispatchers; async/runtime integrations must enforce it.
     pub fn dispatch<D: Dispatcher>(
         &mut self,
         upstream: &UpstreamId,
         request: &CallRequest,
         dispatcher: &mut D,
     ) -> Result<DispatchOutcome, PoolError> {
-        let (max_retries, call_timeout) = {
+        let (max_retries, _call_timeout, retry_cfg) = {
             let slot = self
                 .upstreams
                 .get(upstream)
@@ -1261,28 +1732,52 @@ impl<H: HealthCheck> McpPool<H> {
             (
                 slot.config.effective_max_retries(),
                 slot.config.effective_call_timeout(),
+                slot.config,
             )
         };
 
         let mut attempts = 0u32;
         loop {
             attempts = attempts.saturating_add(1);
+
+            if let Some(slot) = self.upstreams.get_mut(upstream) {
+                slot.maybe_half_open_after_cooldown();
+            }
+
+            // Best-effort recovery for retryable lifecycle states before acquire.
+            match self.state(upstream) {
+                Some(ConnectionState::Disconnected) | Some(ConnectionState::Unhealthy) => {
+                    let _ = self.connect(upstream);
+                }
+                Some(ConnectionState::Connecting) => {
+                    // Fail closed; caller/runtime should not dispatch mid-handshake.
+                }
+                Some(ConnectionState::Connected) | None => {}
+            }
+
             let lease = match self.acquire(upstream) {
                 Ok(l) => l,
                 Err(e) if Self::retryable(&e) && attempts <= max_retries => {
-                    // TODO(runtime): honor retry_backoff/call_timeout with timers.
-                    let _ = call_timeout;
+                    let delay = retry_cfg.retry_delay_for_attempt(attempts);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
             };
 
-            let call_res = dispatcher.call(upstream, request);
+            // TODO(runtime): enforce call_timeout for blocking sync dispatcher calls.
+            let call_res = if self.has_managed_session(upstream) {
+                self.forward_via_managed_session(upstream, request)
+            } else {
+                dispatcher.call(upstream, request)
+            };
             let _ = self.release(lease);
             match call_res {
                 Ok(response) => {
                     if let Some(slot) = self.upstreams.get_mut(upstream) {
-                        slot.breaker.record_success();
+                        slot.record_breaker_success();
                         if slot.state == ConnectionState::Unhealthy {
                             slot.state = ConnectionState::Connected;
                             slot.connection.healthy = true;
@@ -1293,9 +1788,15 @@ impl<H: HealthCheck> McpPool<H> {
                 Err(e) => {
                     if Self::retryable(&e) && attempts <= max_retries {
                         if let Some(slot) = self.upstreams.get_mut(upstream) {
-                            slot.breaker.record_failure();
+                            slot.record_breaker_failure();
+                            slot.state = ConnectionState::Unhealthy;
+                            slot.connection.healthy = false;
+                            slot.session = None;
                         }
-                        // TODO(runtime): honor retry_backoff/call_timeout with timers.
+                        let delay = retry_cfg.retry_delay_for_attempt(attempts);
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
                         continue;
                     }
                     let _ = self.mark_unhealthy(upstream);
@@ -1876,5 +2377,353 @@ mod tests {
             .expect("dispatch");
         assert_eq!(resp.payload, "ok:tools/call");
         assert_eq!(resp.attempts, 1);
+    }
+
+    #[test]
+    fn dispatch_honors_retry_backoff_between_attempts() {
+        let mut pool = McpPool::default();
+        let id = UpstreamId("u".into());
+        pool.register_with_config(
+            id.clone(),
+            UpstreamConfig {
+                max_retries: 2,
+                retry_backoff: Duration::from_millis(12),
+                breaker: CircuitBreakerPolicy {
+                    failure_threshold: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let req = CallRequest {
+            method: "ping".into(),
+            payload: "".into(),
+        };
+        let mut disp = FlakyDispatcher {
+            fail_times: 2,
+            calls: 0,
+        };
+        let start = std::time::Instant::now();
+        let out = pool.dispatch(&id, &req, &mut disp).expect("dispatch");
+        let elapsed = start.elapsed();
+        assert_eq!(out.response.payload, "ok:ping");
+        assert_eq!(out.attempts, 3);
+        assert_eq!(disp.calls, 3);
+        assert!(elapsed >= Duration::from_millis(20), "elapsed {elapsed:?}");
+    }
+
+    #[test]
+    fn dispatch_honors_backoff_on_retryable_acquire_timeout() {
+        let mut pool = McpPool::default();
+        let id = UpstreamId("u".into());
+        pool.register_with_config(
+            id.clone(),
+            UpstreamConfig {
+                max_leases: 1,
+                acquire_timeout: Duration::from_millis(1),
+                max_retries: 2,
+                retry_backoff: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
+        let _held = pool.acquire(&id).expect("held lease");
+        let req = CallRequest {
+            method: "ping".into(),
+            payload: "".into(),
+        };
+        let mut disp = PlaceholderDispatcher;
+        let start = std::time::Instant::now();
+        let err = pool.dispatch(&id, &req, &mut disp).expect_err("timeout");
+        let elapsed = start.elapsed();
+        assert!(matches!(err, PoolError::Timeout { .. }));
+        assert!(elapsed >= Duration::from_millis(18), "elapsed {elapsed:?}");
+    }
+
+    #[test]
+    fn dispatch_recovers_from_unhealthy_state_via_reconnect() {
+        let mut pool = McpPool::default();
+        let id = UpstreamId("u".into());
+        pool.register(id.clone());
+        pool.set_state(&id, ConnectionState::Unhealthy).unwrap();
+        if let Some(slot) = pool.upstreams.get_mut(&id) {
+            slot.connection.healthy = false;
+        }
+        let mut disp = PlaceholderDispatcher;
+        let out = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "ping".into(),
+                    payload: "{}".into(),
+                },
+                &mut disp,
+            )
+            .expect("dispatch after recovery");
+        assert_eq!(out.response.payload, "ok:ping");
+        assert_eq!(pool.state(&id), Some(ConnectionState::Connected));
+    }
+
+    #[test]
+    fn circuit_open_with_zero_cooldown_allows_half_open_probe_on_acquire() {
+        let mut pool = McpPool::default();
+        let id = UpstreamId("u".into());
+        pool.register_with_config(
+            id.clone(),
+            UpstreamConfig {
+                breaker: CircuitBreakerPolicy {
+                    failure_threshold: 1,
+                    half_open_success_threshold: 1,
+                    open_cooldown: Duration::from_secs(0),
+                },
+                ..Default::default()
+            },
+        );
+        if let Some(slot) = pool.upstreams.get_mut(&id) {
+            slot.breaker.state = CircuitState::Open;
+            slot.breaker.failure_count = 1;
+            slot.circuit_opened_at = Some(std::time::Instant::now());
+        }
+        let lease = pool.acquire(&id).expect("half-open acquire");
+        pool.release(lease).unwrap();
+        assert_eq!(
+            pool.breaker(&id).map(|b| b.state),
+            Some(CircuitState::Closed)
+        );
+    }
+
+    #[test]
+    fn dispatch_recovers_after_recorded_open_with_zero_cooldown() {
+        let mut pool = McpPool::default();
+        let id = UpstreamId("u".into());
+        pool.register_with_config(
+            id.clone(),
+            UpstreamConfig {
+                max_retries: 0,
+                breaker: CircuitBreakerPolicy {
+                    failure_threshold: 1,
+                    half_open_success_threshold: 1,
+                    open_cooldown: Duration::from_secs(0),
+                },
+                ..Default::default()
+            },
+        );
+        let mut failing = FailingDispatcher;
+        let req = CallRequest {
+            method: "x".into(),
+            payload: "{}".into(),
+        };
+        assert!(pool.dispatch(&id, &req, &mut failing).is_err());
+        assert_eq!(pool.breaker(&id).map(|b| b.state), Some(CircuitState::Open));
+
+        let mut ok = PlaceholderDispatcher;
+        let out = pool
+            .dispatch(&id, &req, &mut ok)
+            .expect("recovered dispatch after cooldown probe");
+        assert_eq!(out.response.payload, "ok:x");
+        assert_eq!(pool.state(&id), Some(ConnectionState::Connected));
+    }
+
+    #[test]
+    fn sync_stdio_pool_dispatch_reaches_real_upstream_for_mcp_methods() {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*|*"initialize"*)
+      echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mock-stdio"}}}'
+      ;;
+    *'"method":"tools/list"'*|*"tools/list"*)
+      echo '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"gateway.health","inputSchema":{"type":"object"}}]}}'
+      ;;
+    *'"method":"tools/call"'*|*"tools/call"*)
+      echo '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}}'
+      ;;
+    *'"method":"ping"'*|*"ping"*)
+      echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+      ;;
+    *)
+      echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}'
+      ;;
+  esac
+done
+"#;
+        let server =
+            UpstreamServerConfig::with_stdio("stdio-up", "sh", vec!["-c".into(), script.into()]);
+        let id = server.id.clone();
+        let mut pool = McpPool::default();
+        pool.register_with_server_config(server, UpstreamConfig::default());
+        pool.connect(&id).expect("connect real stdio upstream");
+
+        // Gateway S1 compatibility: external placeholder dispatcher provided, but pool-managed
+        // real stdio session must receive forwarded initialize/tools/list/tools/call requests.
+        let mut external = PlaceholderDispatcher;
+        for method in ["initialize", "tools/list", "tools/call"] {
+            let payload =
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{method}\",\"params\":{{}}}}");
+            let out = pool
+                .dispatch(
+                    &id,
+                    &CallRequest {
+                        method: method.into(),
+                        payload,
+                    },
+                    &mut external,
+                )
+                .expect("dispatch to real stdio upstream");
+            assert_eq!(out.attempts, 1, "method {method}");
+            assert!(
+                !out.response.payload.contains("ok:"),
+                "must not use placeholder dispatcher for managed stdio session: {}",
+                out.response.payload
+            );
+        }
+
+        // Bridge/front seam remains compatible and reaches the same managed session.
+        let mut bridge = PoolFrontBridge::new(&mut pool, &mut external);
+        let resp = bridge
+            .dispatch(FrontDispatchRequest {
+                upstream: id.clone(),
+                method: "tools/call".into(),
+                payload: r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"gateway.health","arguments":{}}}"#.into(),
+            })
+            .expect("front bridge dispatch");
+        assert!(resp.payload.contains("content") || resp.payload.contains("ok"));
+    }
+
+    #[test]
+    fn sync_stdio_pool_dispatches_s1_with_demo_server() {
+        let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../e2e/stdio_demo_mcp_server.py");
+        assert!(
+            demo.exists(),
+            "demo server script missing at {}",
+            demo.display()
+        );
+        let server = UpstreamServerConfig::with_stdio(
+            "demo",
+            "python3",
+            vec!["-u".into(), demo.to_string_lossy().into_owned()],
+        );
+        let id = server.id.clone();
+        let mut pool = McpPool::default();
+        pool.register_with_server_config(server, UpstreamConfig::default());
+        pool.connect(&id).expect("connect demo stdio upstream");
+        let mut external = PlaceholderDispatcher;
+
+        let init = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "initialize".into(),
+                    payload: r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#.into(),
+                },
+                &mut external,
+            )
+            .expect("initialize");
+        assert!(
+            init.response.payload.contains("protocolVersion"),
+            "{}",
+            init.response.payload
+        );
+
+        let listed = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "tools/list".into(),
+                    payload: r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#.into(),
+                },
+                &mut external,
+            )
+            .expect("tools/list");
+        assert!(
+            listed.response.payload.contains("demo.echo"),
+            "{}",
+            listed.response.payload
+        );
+
+        let called = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "tools/call".into(),
+                    payload: r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"demo.echo","arguments":{"message":"hello"}}}"#.into(),
+                },
+                &mut external,
+            )
+            .expect("tools/call");
+        assert!(
+            called.response.payload.contains("hello"),
+            "{}",
+            called.response.payload
+        );
+
+        pool.disconnect(&id).expect("disconnect");
+        assert_eq!(pool.state(&id), Some(ConnectionState::Disconnected));
+    }
+
+    #[test]
+    fn sync_stdio_pool_recovers_after_upstream_restart_s1() {
+        // One-request-per-process server: simulates stdio upstream exit between calls.
+        // With no retries, dispatch must fail closed on dead session; reconnect restarts it.
+        let script = r#"IFS= read -r line; echo '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#;
+        let server = UpstreamServerConfig::with_stdio(
+            "stdio-restart",
+            "sh",
+            vec!["-c".into(), script.into()],
+        );
+        let id = server.id.clone();
+        let mut pool = McpPool::default();
+        pool.register_with_server_config(
+            server,
+            UpstreamConfig {
+                max_retries: 0,
+                retry: RetryPolicy {
+                    max_retries: 0,
+                    backoff: Duration::from_millis(0),
+                },
+                ..Default::default()
+            },
+        );
+        pool.connect(&id).expect("connect");
+        let mut external = PlaceholderDispatcher;
+
+        let first = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "ping".into(),
+                    payload: "{}".into(),
+                },
+                &mut external,
+            )
+            .expect("first dispatch");
+        assert!(first.response.payload.contains("ok"));
+
+        let second = pool.dispatch(
+            &id,
+            &CallRequest {
+                method: "ping".into(),
+                payload: "{}".into(),
+            },
+            &mut external,
+        );
+        assert!(second.is_err(), "dead stdio session must fail closed");
+        assert!(matches!(
+            pool.state(&id),
+            Some(ConnectionState::Unhealthy | ConnectionState::Disconnected)
+        ));
+
+        pool.reconnect(&id).expect("reconnect/restart");
+        let third = pool
+            .dispatch(
+                &id,
+                &CallRequest {
+                    method: "ping".into(),
+                    payload: "{}".into(),
+                },
+                &mut external,
+            )
+            .expect("dispatch after restart");
+        assert!(third.response.payload.contains("ok"));
     }
 }

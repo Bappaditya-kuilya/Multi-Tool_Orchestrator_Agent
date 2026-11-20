@@ -253,6 +253,13 @@ impl TransportMetadata {
         self.headers
             .get(name)
             .or_else(|| self.headers.get(&name.to_ascii_lowercase()))
+            .or_else(|| {
+                let needle = name.to_ascii_lowercase();
+                self.headers
+                    .iter()
+                    .find(|(k, _)| k.to_ascii_lowercase() == needle)
+                    .map(|(_, v)| v)
+            })
             .map(String::as_str)
     }
 
@@ -379,12 +386,18 @@ impl McpResponseEnvelope {
         } else if let Some(val) = &self.json_result {
             JsonRpcResponse::success(JsonRpcId::Str(self.id.clone()), val.clone())
         } else {
-            let val = self
-                .result
-                .as_ref()
-                .map(|r| serde_json::to_value(r.as_call_tool_payload()).unwrap_or_else(|_| serde_json::json!({"content":[{"type":"text","text":r.content}],"isError":r.is_error})))
-                .unwrap_or(serde_json::Value::Null);
-            JsonRpcResponse::success(JsonRpcId::Str(self.id.clone()), val)
+            let val = self.result.as_ref().map(|r| {
+                serde_json::to_value(r.as_call_tool_payload()).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "content":[{"type":"text","text":r.content}],
+                        "isError":r.is_error
+                    })
+                })
+            });
+            JsonRpcResponse::success(
+                JsonRpcId::Str(self.id.clone()),
+                val.unwrap_or(serde_json::Value::Null),
+            )
         }
     }
 }
@@ -942,6 +955,9 @@ fn parse_args(raw: &str) -> BTreeMap<String, String> {
 }
 
 /// JSON-RPC parser stub for MCP messages (`tools/call`, `tools/list`, etc.).
+///
+/// Parses protocol envelope fields, preserves best-effort string params for hooks,
+/// and extracts structured `tools/call` arguments for front-to-pool bridging.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JsonRpcParser;
 
@@ -951,41 +967,85 @@ impl RequestParser for JsonRpcParser {
         if raw.is_empty() {
             return Err(FrontError::Parse("empty request".into()));
         }
-        let req: JsonRpcRequest = serde_json::from_str(raw)
+        let value: serde_json::Value = serde_json::from_str(raw)
             .map_err(|e| FrontError::Parse(format!("invalid json-rpc: {e}")))?;
-        if req.jsonrpc != "2.0" {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| FrontError::Parse("json-rpc request must be an object".into()))?;
+        if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
             return Err(FrontError::Parse("jsonrpc must be '2.0'".into()));
         }
-        let id = req
-            .id
-            .map(|i| i.as_request_id())
-            .unwrap_or_else(|| "notification".into());
+        let method = obj
+            .get("method")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| FrontError::Parse("json-rpc method must be a string".into()))?
+            .to_string();
+        let id = match obj.get("id") {
+            None | Some(serde_json::Value::Null) => "notification".into(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(_) => {
+                return Err(FrontError::Parse(
+                    "json-rpc id must be a string, number, or null".into(),
+                ))
+            }
+        };
+
         let mut params = RequestParams::default();
-        if req.method == "tools/call" {
-            if let Some(p) = req.params.clone() {
-                let call: CallToolParams = serde_json::from_value(p.clone()).map_err(|e| {
-                    FrontError::Validation(format!("invalid tools/call params: {e}"))
-                })?;
-                let mut flat = BTreeMap::new();
-                if let Some(serde_json::Value::Object(map)) = &call.arguments {
+        match obj.get("params") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(p) => {
+                // Best-effort flat fields for auth/policy/routing hooks.
+                if let Some(map) = p.as_object() {
                     for (k, v) in map {
-                        if let Some(s) = v.as_str() {
-                            flat.insert(k.clone(), s.to_string());
-                        } else {
-                            flat.insert(k.clone(), v.to_string());
+                        match v {
+                            serde_json::Value::String(s) => {
+                                params.fields.insert(k.clone(), s.clone());
+                            }
+                            serde_json::Value::Number(n) => {
+                                params.fields.insert(k.clone(), n.to_string());
+                            }
+                            serde_json::Value::Bool(b) => {
+                                params.fields.insert(k.clone(), b.to_string());
+                            }
+                            _ => {}
                         }
                     }
                 }
-                params.tool_call = Some(ToolCall {
-                    name: call.name,
-                    arguments: flat,
-                    raw_arguments: call.arguments,
-                });
+
+                if method == "tools/call" {
+                    // Validate/extract via rmcp's protocol model for upstream compatibility,
+                    // then preserve front's flat/raw argument views for hooks and dispatch.
+                    let rmcp_call: rmcp::model::CallToolRequestParam =
+                        serde_json::from_value(p.clone()).map_err(|e| {
+                            FrontError::Validation(format!("invalid tools/call params: {e}"))
+                        })?;
+                    let raw_arguments = rmcp_call
+                        .arguments
+                        .as_ref()
+                        .map(|m| serde_json::Value::Object(m.clone()));
+                    let mut flat = BTreeMap::new();
+                    if let Some(map) = &rmcp_call.arguments {
+                        for (k, v) in map {
+                            if let Some(s) = v.as_str() {
+                                flat.insert(k.clone(), s.to_string());
+                            } else {
+                                flat.insert(k.clone(), v.to_string());
+                            }
+                        }
+                    }
+                    params.tool_call = Some(ToolCall {
+                        name: rmcp_call.name.to_string(),
+                        arguments: flat,
+                        raw_arguments,
+                    });
+                }
             }
         }
+
         Ok(McpRequestEnvelope {
             id,
-            method: req.method,
+            method,
             params,
             raw: raw.to_string(),
             transport: TransportMetadata::default(),
@@ -993,14 +1053,14 @@ impl RequestParser for JsonRpcParser {
     }
 }
 
-/// Auto parser: tries JSON-RPC then skeleton format.
+/// Auto parser: tries JSON-RPC for JSON payloads, else skeleton format.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AutoParser;
 
 impl RequestParser for AutoParser {
     fn parse(&self, raw: &str) -> Result<McpRequestEnvelope, FrontError> {
         let trimmed = raw.trim();
-        if trimmed.starts_with('{') {
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
             JsonRpcParser.parse(trimmed)
         } else {
             SkeletonParser.parse(trimmed)
@@ -1064,6 +1124,7 @@ impl TokenContextProvider for HeaderTokenContextProvider {
                 .transport
                 .session_id
                 .clone()
+                .or_else(|| req.transport.header("mcp-session-id").map(str::to_string))
                 .or_else(|| req.params.fields.get("session_id").cloned()),
             ..Default::default()
         };
@@ -1253,6 +1314,41 @@ impl RequestRouter for PlaceholderRouter {
     }
 }
 
+/// Router that honors an explicit upstream hint from transport attributes/params.
+///
+/// Falls back to `PlaceholderRouter` behavior (including scope/tool validation) and
+/// only overrides `upstream_id` when a non-empty hint is present.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UpstreamHintRouter;
+
+impl UpstreamHintRouter {
+    pub fn hinted_upstream(req: &McpRequestEnvelope) -> Option<String> {
+        req.transport
+            .attribute("upstream")
+            .or_else(|| req.transport.attribute("upstream_id"))
+            .or_else(|| req.params.fields.get("upstream").map(String::as_str))
+            .or_else(|| req.params.fields.get("upstream_id").map(String::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+}
+
+impl RequestRouter for UpstreamHintRouter {
+    fn route(
+        &self,
+        req: &McpRequestEnvelope,
+        auth: &AuthContext,
+        tool_call: Option<&ToolCall>,
+    ) -> Result<UpstreamTarget, FrontError> {
+        let mut target = PlaceholderRouter.route(req, auth, tool_call)?;
+        if let Some(upstream) = Self::hinted_upstream(req) {
+            target.upstream_id = upstream;
+        }
+        Ok(target)
+    }
+}
+
 /// Default dispatcher placeholder producing a routed response envelope.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlaceholderDispatcher;
@@ -1319,8 +1415,11 @@ impl ResponseShaper {
         }
     }
 
-    pub fn shape_upstream(resp: McpResponseEnvelope) -> McpResponseEnvelope {
-        // TODO(rmcp): normalize MCP content/items, tool result wrappers, and protocol metadata.
+    pub fn shape_upstream(mut resp: McpResponseEnvelope) -> McpResponseEnvelope {
+        // Normalize protocol-facing success envelopes for JSON-RPC/rmcp bridges.
+        if resp.error.is_none() && resp.json_result.is_none() && resp.result.is_none() {
+            resp.json_result = Some(serde_json::Value::Null);
+        }
         resp
     }
 }
@@ -1340,7 +1439,7 @@ pub struct McpFront<
     Pol = AllowAllPolicy,
     Ta = CleanTaintTracker,
     Ap = NoApprovalGate,
-    R = PlaceholderRouter,
+    R = UpstreamHintRouter,
     D = PlaceholderDispatcher,
 > {
     parser: P,
@@ -1366,7 +1465,7 @@ impl Default for McpFront {
             AllowAllPolicy,
             CleanTaintTracker,
             NoApprovalGate,
-            PlaceholderRouter,
+            UpstreamHintRouter,
             PlaceholderDispatcher,
         )
     }
@@ -1420,6 +1519,20 @@ where
         self.accept_request(req)
     }
 
+    /// Accepts raw input with transport metadata and returns a response envelope.
+    ///
+    /// This preserves auth/policy/taint hook context for runtime transports while
+    /// keeping parsing and dispatch fail-closed.
+    pub fn accept_with_transport(
+        &self,
+        raw: &str,
+        transport: TransportMetadata,
+    ) -> Result<McpResponseEnvelope, FrontError> {
+        let mut req = self.parser.parse(raw)?;
+        req.transport = transport;
+        self.accept_request(req)
+    }
+
     /// Accepts a parsed/constructed request and returns a response envelope.
     pub fn accept_request(
         &self,
@@ -1445,6 +1558,18 @@ where
     /// Accepts raw input and maps any front error to a shaped error response when possible.
     pub fn accept_mapped(&self, raw: &str) -> McpResponseEnvelope {
         match self.accept(raw) {
+            Ok(resp) => resp,
+            Err(err) => ResponseShaper::map_error(Self::best_effort_id(raw), &err),
+        }
+    }
+
+    /// Accepts raw input with transport metadata and maps errors to shaped responses.
+    pub fn accept_mapped_with_transport(
+        &self,
+        raw: &str,
+        transport: TransportMetadata,
+    ) -> McpResponseEnvelope {
+        match self.accept_with_transport(raw, transport) {
             Ok(resp) => resp,
             Err(err) => ResponseShaper::map_error(Self::best_effort_id(raw), &err),
         }
@@ -1487,7 +1612,23 @@ where
     }
 
     fn best_effort_id(raw: &str) -> RequestId {
-        raw.trim()
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return "unknown".into();
+        }
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(id) = v.get("id") {
+                    return match id {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => "unknown".into(),
+                    };
+                }
+            }
+            return "unknown".into();
+        }
+        trimmed
             .split('|')
             .next()
             .map(str::trim)
@@ -1643,10 +1784,188 @@ impl CoreApprovalAdapter for FailClosedCoreAdapters {
 // Pool dispatch integration hooks (mcp-pool)
 // ---------------------------------------------------------------------------
 
+fn is_jsonrpc_notification_raw(raw: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return false;
+    };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    obj.contains_key("method") && !obj.contains_key("id")
+}
+
+fn dispatch_pool_jsonrpc_payload(request: &DispatchRequest) -> String {
+    // Prefer forwarding the original JSON-RPC envelope when present so arbitrary
+    // method params/ids are preserved for rmcp/front-to-pool runtime bridges.
+    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&request.raw) {
+        if let Some(obj) = v.as_object_mut() {
+            obj.entry("jsonrpc".to_string())
+                .or_insert_with(|| serde_json::json!("2.0"));
+            if obj.get("id").is_none() && !is_jsonrpc_notification_raw(&request.raw) {
+                obj.insert("id".to_string(), serde_json::json!(request.id));
+            }
+            if obj.get("method").is_none() {
+                obj.insert("method".to_string(), serde_json::json!(request.method));
+            }
+            if obj.get("params").is_none() {
+                if let Some(tc) = &request.tool_call {
+                    obj.insert(
+                        "params".to_string(),
+                        serde_json::json!({
+                            "name": tc.name,
+                            "arguments": tc.raw_arguments.clone().unwrap_or_else(|| {
+                                serde_json::to_value(&tc.arguments).unwrap_or(serde_json::json!({}))
+                            }),
+                        }),
+                    );
+                }
+            }
+            return v.to_string();
+        }
+    }
+
+    if is_jsonrpc_notification_raw(&request.raw) {
+        return serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": request.method,
+            "params": request.tool_call.as_ref().map(|tc| serde_json::json!({
+                "name": tc.name,
+                "arguments": tc.raw_arguments.clone().unwrap_or_else(|| {
+                    serde_json::to_value(&tc.arguments).unwrap_or(serde_json::json!({}))
+                }),
+            })),
+        })
+        .to_string();
+    }
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.id,
+        "method": request.method,
+        "params": request.tool_call.as_ref().map(|tc| serde_json::json!({
+            "name": tc.name,
+            "arguments": tc.raw_arguments.clone().unwrap_or_else(|| {
+                serde_json::to_value(&tc.arguments).unwrap_or(serde_json::json!({}))
+            }),
+        })),
+    })
+    .to_string()
+}
+
+fn decode_pool_forward_response(request_id: &str, payload: &str) -> McpResponseEnvelope {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return ResponseShaper::map_error(
+            request_id.to_string(),
+            &FrontError::Dispatch("empty upstream response payload".into()),
+        );
+    }
+
+    if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
+        if resp.result.is_none() && resp.error.is_none() {
+            return ResponseShaper::map_error(
+                request_id.to_string(),
+                &FrontError::Dispatch("upstream response missing result/error".into()),
+            );
+        }
+        return McpResponseEnvelope {
+            id: resp.id.as_request_id(),
+            result: None,
+            json_result: resp.result,
+            error: resp.error.map(|e| McpErrorBody {
+                code: e.code,
+                message: e.message,
+                data: e.data,
+            }),
+        };
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return ResponseShaper::map_error(
+            request_id.to_string(),
+            &FrontError::Dispatch("upstream response is not valid JSON".into()),
+        );
+    };
+
+    let Some(obj) = value.as_object() else {
+        return ResponseShaper::map_error(
+            request_id.to_string(),
+            &FrontError::Dispatch("upstream response must be a JSON-RPC object".into()),
+        );
+    };
+
+    // Fail-closed normalization: only accept response-shaped JSON-RPC objects.
+    let has_result = obj.contains_key("result");
+    let has_error = obj.contains_key("error");
+    if !has_result && !has_error {
+        return ResponseShaper::map_error(
+            request_id.to_string(),
+            &FrontError::Dispatch("upstream response missing result/error".into()),
+        );
+    }
+
+    let id = match obj.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Null) | None => request_id.to_string(),
+        Some(_) => {
+            return ResponseShaper::map_error(
+                request_id.to_string(),
+                &FrontError::Dispatch("upstream response id has invalid type".into()),
+            );
+        }
+    };
+
+    let error = match obj.get("error") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(err_val) => {
+            let Some(err_obj) = err_val.as_object() else {
+                return ResponseShaper::map_error(
+                    request_id.to_string(),
+                    &FrontError::Dispatch("upstream response error must be an object".into()),
+                );
+            };
+            let Some(code) = err_obj.get("code").and_then(serde_json::Value::as_i64) else {
+                return ResponseShaper::map_error(
+                    request_id.to_string(),
+                    &FrontError::Dispatch("upstream response error.code must be an integer".into()),
+                );
+            };
+            let Ok(code) = i32::try_from(code) else {
+                return ResponseShaper::map_error(
+                    request_id.to_string(),
+                    &FrontError::Dispatch("upstream response error.code out of range".into()),
+                );
+            };
+            let message = err_obj
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("upstream error")
+                .to_string();
+            Some(McpErrorBody {
+                code,
+                message,
+                data: err_obj.get("data").cloned(),
+            })
+        }
+    };
+
+    McpResponseEnvelope {
+        id,
+        result: None,
+        json_result: obj
+            .get("result")
+            .cloned()
+            .filter(|v| !v.is_null() || error.is_none()),
+        error,
+    }
+}
+
 /// Adapts an `mcp_pool::RequestForwarder` as an `UpstreamDispatcher`.
 ///
-/// Tool calls are forwarded as `tools/call` payloads; other methods are forwarded
-/// as raw request envelopes. Fail-closed on forward errors.
+/// Tool calls and protocol requests are forwarded as JSON-RPC envelopes.
+/// For JSON requests, original params/id are preserved when possible to keep
+/// front-to-pool bridging close to rmcp-compatible runtime flows.
 pub struct PoolRequestForwarderDispatcher<F> {
     pub forwarder: F,
     pub upstream_id: mcp_pool::UpstreamId,
@@ -1659,79 +1978,44 @@ impl<F> PoolRequestForwarderDispatcher<F> {
             upstream_id: mcp_pool::UpstreamId(upstream_id.into()),
         }
     }
+
+    fn resolve_upstream_id(&self, request: &DispatchRequest) -> mcp_pool::UpstreamId {
+        let target = request.target.upstream_id.trim();
+        if target.is_empty() {
+            self.upstream_id.clone()
+        } else {
+            mcp_pool::UpstreamId(target.to_string())
+        }
+    }
 }
 
 impl<F: mcp_pool::RequestForwarder> UpstreamDispatcher for PoolRequestForwarderDispatcher<F> {
-    fn dispatch(&self, request: &DispatchRequest) -> Result<McpResponseEnvelope, FrontError> {
-        let payload = serde_json::json!({
-            "id": request.id,
-            "method": request.method,
-            "target": {
-                "upstream_id": request.target.upstream_id,
-                "tool_name": request.target.tool_name,
-            },
-            "tool_call": request.tool_call.as_ref().map(|tc| serde_json::json!({
-                "name": tc.name,
-                "arguments": tc.arguments,
-                "raw_arguments": tc.raw_arguments,
-            })),
-            "raw": request.raw,
-        })
-        .to_string();
-        let _fwd = mcp_pool::CallRequest {
-            method: request.method.clone(),
-            payload,
-        };
+    fn dispatch(&self, _request: &DispatchRequest) -> Result<McpResponseEnvelope, FrontError> {
         // RequestForwarder takes &mut self in pool API; immutable dispatch is fail-closed.
         // Use `dispatch_mut` or `SharedPoolForwarderDispatcher`.
         Err(FrontError::Dispatch(
-            "PoolRequestForwarderDispatcher requires mutable forwarder; use dispatch_mut".into(),
+            "PoolRequestForwarderDispatcher requires mutable forwarder; use dispatch_mut or SharedPoolForwarderDispatcher".into(),
         ))
     }
 }
 
 impl<F: mcp_pool::RequestForwarder> PoolRequestForwarderDispatcher<F> {
     /// Mutable dispatch hook for pool forwarders.
-    /// Mutable dispatch hook for pool forwarders.
     pub fn dispatch_mut(
         &mut self,
         request: &DispatchRequest,
     ) -> Result<McpResponseEnvelope, FrontError> {
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request.id,
-            "method": request.method,
-            "params": request.tool_call.as_ref().map(|tc| serde_json::json!({
-                "name": tc.name,
-                "arguments": tc.raw_arguments.clone().unwrap_or_else(|| serde_json::to_value(&tc.arguments).unwrap_or(serde_json::json!({}))),
-            })),
-            "raw": request.raw,
-        })
-        .to_string();
+        let upstream_id = self.resolve_upstream_id(request);
+        let payload = dispatch_pool_jsonrpc_payload(request);
         let fwd = mcp_pool::CallRequest {
             method: request.method.clone(),
             payload,
         };
         let out = self
             .forwarder
-            .forward(&self.upstream_id, &fwd)
+            .forward(&upstream_id, &fwd)
             .map_err(|e| FrontError::Dispatch(format!("pool forward failed: {e}")))?;
-        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&out.payload) {
-            Ok(McpResponseEnvelope {
-                id: resp.id.as_request_id(),
-                result: None,
-                json_result: resp.result,
-                error: resp.error.map(|e| McpErrorBody {
-                    code: e.code,
-                    message: e.message,
-                    data: e.data,
-                }),
-            })
-        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out.payload) {
-            Ok(ResponseShaper::success_json(request.id.clone(), v))
-        } else {
-            Ok(ResponseShaper::success(request.id.clone(), out.payload))
-        }
+        Ok(decode_pool_forward_response(&request.id, &out.payload))
     }
 }
 
@@ -1751,48 +2035,33 @@ impl<F> SharedPoolForwarderDispatcher<F> {
             upstream_id: mcp_pool::UpstreamId(upstream_id.into()),
         }
     }
+
+    fn resolve_upstream_id(&self, request: &DispatchRequest) -> mcp_pool::UpstreamId {
+        let target = request.target.upstream_id.trim();
+        if target.is_empty() {
+            self.upstream_id.clone()
+        } else {
+            mcp_pool::UpstreamId(target.to_string())
+        }
+    }
 }
 
 impl<F: mcp_pool::RequestForwarder> UpstreamDispatcher for SharedPoolForwarderDispatcher<F> {
     fn dispatch(&self, request: &DispatchRequest) -> Result<McpResponseEnvelope, FrontError> {
+        let upstream_id = self.resolve_upstream_id(request);
         let mut g = self
             .forwarder
             .lock()
             .map_err(|_| FrontError::Dispatch("pool forwarder mutex poisoned".into()))?;
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request.id,
-            "method": request.method,
-            "params": request.tool_call.as_ref().map(|tc| serde_json::json!({
-                "name": tc.name,
-                "arguments": tc.raw_arguments.clone().unwrap_or_else(|| serde_json::to_value(&tc.arguments).unwrap_or(serde_json::json!({}))),
-            })),
-            "raw": request.raw,
-        })
-        .to_string();
+        let payload = dispatch_pool_jsonrpc_payload(request);
         let fwd = mcp_pool::CallRequest {
             method: request.method.clone(),
             payload,
         };
         let out = g
-            .forward(&self.upstream_id, &fwd)
+            .forward(&upstream_id, &fwd)
             .map_err(|e| FrontError::Dispatch(format!("pool forward failed: {e}")))?;
-        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&out.payload) {
-            Ok(McpResponseEnvelope {
-                id: resp.id.as_request_id(),
-                result: None,
-                json_result: resp.result,
-                error: resp.error.map(|e| McpErrorBody {
-                    code: e.code,
-                    message: e.message,
-                    data: e.data,
-                }),
-            })
-        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out.payload) {
-            Ok(ResponseShaper::success_json(request.id.clone(), v))
-        } else {
-            Ok(ResponseShaper::success(request.id.clone(), out.payload))
-        }
+        Ok(decode_pool_forward_response(&request.id, &out.payload))
     }
 }
 
@@ -1935,6 +2204,52 @@ impl ApprovalGate for CoreAwareApprovalGate {
 // Gateway HTTP endpoint handler integration (gateway types)
 // ---------------------------------------------------------------------------
 
+/// Build raw JSON-RPC input and transport metadata from gateway MCP request/context.
+///
+/// Preserves `req.upstream` as a transport attribute for upstream-selecting routers/dispatch.
+/// Injects HTTP authorization into transport headers when provided.
+pub fn gateway_bridge_input(
+    req: &gateway::mcp::McpRequest,
+    ctx: Option<&gateway::mcp::McpHttpContext>,
+) -> (String, TransportMetadata) {
+    let raw = if !req.payload_json.trim().is_empty() {
+        req.payload_json.clone()
+    } else if !req.method.trim().is_empty() {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": format!("gw-{}", req.method),
+            "method": req.method,
+        })
+        .to_string()
+    } else {
+        String::new()
+    };
+    let mut transport = TransportMetadata::default();
+    if let Some(ctx) = ctx {
+        if let Some(auth) = ctx
+            .authorization
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            transport
+                .headers
+                .insert("authorization".into(), auth.to_string());
+        }
+    }
+    if let Some(upstream) = req
+        .upstream
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        transport
+            .attributes
+            .insert("upstream".into(), upstream.to_string());
+    }
+    (raw, transport)
+}
+
 /// Handle a gateway MCP endpoint request through the front pipeline.
 ///
 /// Integrates with `gateway::mcp::{McpRequest,McpResponse}` types while keeping
@@ -1946,18 +2261,57 @@ pub fn handle_gateway_mcp_request<F>(
 where
     F: Fn(&str) -> McpResponseEnvelope,
 {
-    // Prefer payload_json as JSON-RPC/raw MCP message; if method hints tools/list/call
-    // but payload is empty, synthesize a minimal skeleton envelope for compatibility.
-    let raw = if !req.payload_json.trim().is_empty() {
-        req.payload_json
-    } else if !req.method.trim().is_empty() {
-        format!("gw-{}|{}", req.method, req.method)
-    } else {
-        String::new()
-    };
+    handle_gateway_mcp_request_with_context(front, req, None)
+}
+
+/// Handle a gateway MCP request with HTTP/auth context and upstream hint propagation.
+pub fn handle_gateway_mcp_request_with_context<F>(
+    front: &F,
+    req: gateway::mcp::McpRequest,
+    ctx: Option<&gateway::mcp::McpHttpContext>,
+) -> gateway::mcp::McpResponse
+where
+    F: Fn(&str) -> McpResponseEnvelope,
+{
+    let (raw, _transport) = gateway_bridge_input(&req, ctx);
+    // Closure-based bridge cannot receive transport; callers needing transport-aware
+    // handling should use `handle_gateway_mcp_with_front_context`.
     let resp = front(&raw);
-    let payload_json = serde_json::to_string(&resp.to_json_rpc())
-        .unwrap_or_else(|_| "{\"jsonrpc\":\"2.0\",\"id\":\"unknown\",\"error\":{\"code\":-32603,\"message\":\"serialization failed\"}}".to_string());
+    let payload_json = serde_json::to_string(&resp.to_json_rpc()).unwrap_or_else(|_| {
+        "{\"jsonrpc\":\"2.0\",\"id\":\"unknown\",\"error\":{\"code\":-32603,\"message\":\"serialization failed\"}}"
+            .to_string()
+    });
+    gateway::mcp::McpResponse {
+        ok: resp.error.is_none(),
+        payload_json,
+        fail_closed: resp.error.is_some(),
+    }
+}
+
+/// Transport-aware gateway bridge using `McpFront` directly.
+pub fn handle_gateway_mcp_with_front_context<P, V, E, T, A, Pol, Ta, Ap, R, D>(
+    front: &McpFront<P, V, E, T, A, Pol, Ta, Ap, R, D>,
+    req: gateway::mcp::McpRequest,
+    ctx: Option<&gateway::mcp::McpHttpContext>,
+) -> gateway::mcp::McpResponse
+where
+    P: RequestParser,
+    V: RequestValidator,
+    E: ToolCallExtractor,
+    T: TokenContextProvider,
+    A: Authenticator,
+    Pol: PolicyEvaluator,
+    Ta: TaintTracker,
+    Ap: ApprovalGate,
+    R: RequestRouter,
+    D: UpstreamDispatcher,
+{
+    let (raw, transport) = gateway_bridge_input(&req, ctx);
+    let resp = front.accept_mapped_with_transport(&raw, transport);
+    let payload_json = serde_json::to_string(&resp.to_json_rpc()).unwrap_or_else(|_| {
+        "{\"jsonrpc\":\"2.0\",\"id\":\"unknown\",\"error\":{\"code\":-32603,\"message\":\"serialization failed\"}}"
+            .to_string()
+    });
     gateway::mcp::McpResponse {
         ok: resp.error.is_none(),
         payload_json,
@@ -2001,6 +2355,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Process a single line/frame through the front and return serialized JSON-RPC.
+/// JSON-RPC notifications (requests without `id`) are processed but produce no response.
 pub fn process_line<P, V, E, T, A, Pol, Ta, Ap, R, D>(
     front: &McpFront<P, V, E, T, A, Pol, Ta, Ap, R, D>,
     line: &str,
@@ -2022,6 +2377,9 @@ where
         return None;
     }
     let resp = front.accept_mapped(trimmed);
+    if is_jsonrpc_notification_raw(trimmed) {
+        return None;
+    }
     serde_json::to_string(&resp.to_json_rpc()).ok()
 }
 
@@ -2139,6 +2497,19 @@ mod tests {
         let result = resp.result.expect("result");
         assert_eq!(result.content, "routed:default:echo");
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn default_front_honors_transport_upstream_hint() {
+        let front = McpFront::default();
+        let mut transport = TransportMetadata::default();
+        transport
+            .attributes
+            .insert("upstream".into(), "pool-a".into());
+        let resp = front
+            .accept_with_transport("1|tools/call|echo|text=hi", transport)
+            .expect("ok");
+        assert_eq!(resp.result.expect("result").content, "routed:pool-a:echo");
     }
 
     #[test]
@@ -2415,6 +2786,43 @@ mod tests {
     }
 
     #[test]
+    fn jsonrpc_parser_uses_rmcp_model_for_tools_call_structured_args() {
+        let call = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"sum","arguments":{"a":1,"b":true,"s":"x","obj":{"k":"v"}}}}"#;
+        let req = JsonRpcParser.parse(call).expect("parse call");
+        let tc = req.tool_call().expect("tc");
+        assert_eq!(tc.name, "sum");
+        assert_eq!(tc.arguments.get("s").map(String::as_str), Some("x"));
+        // flat view stringifies non-string values for hook compatibility
+        assert_eq!(tc.arguments.get("a").map(String::as_str), Some("1"));
+        assert_eq!(tc.arguments.get("b").map(String::as_str), Some("true"));
+        let raw = tc.raw_arguments.as_ref().expect("raw args");
+        assert_eq!(raw["a"], serde_json::json!(1));
+        assert_eq!(raw["b"], serde_json::json!(true));
+        assert_eq!(raw["obj"]["k"], serde_json::json!("v"));
+    }
+
+    #[test]
+    fn jsonrpc_parser_preserves_flat_params_for_hooks() {
+        let raw = r#"{"jsonrpc":"2.0","id":"r1","method":"resources/read","params":{"uri":"file:///tmp/x","tenant":"t1","n":2,"ok":true}}"#;
+        let req = JsonRpcParser.parse(raw).expect("parse");
+        assert_eq!(req.method, "resources/read");
+        assert_eq!(
+            req.params.fields.get("uri").map(String::as_str),
+            Some("file:///tmp/x")
+        );
+        assert_eq!(
+            req.params.fields.get("tenant").map(String::as_str),
+            Some("t1")
+        );
+        assert_eq!(req.params.fields.get("n").map(String::as_str), Some("2"));
+        assert_eq!(
+            req.params.fields.get("ok").map(String::as_str),
+            Some("true")
+        );
+        assert!(req.tool_call().is_none());
+    }
+
+    #[test]
     fn auto_parser_selects_json_or_skeleton() {
         let req = AutoParser
             .parse(r#"{"jsonrpc":"2.0","id":"x","method":"ping"}"#)
@@ -2649,7 +3057,7 @@ mod tests {
             AllowAllPolicy,
             CleanTaintTracker,
             NoApprovalGate,
-            PlaceholderRouter,
+            UpstreamHintRouter,
             PlaceholderDispatcher,
         )
     }
@@ -2665,6 +3073,15 @@ mod tests {
         let resp = handle_gateway_mcp_request(&|raw| front.accept_mapped(raw), req);
         assert!(resp.ok, "{}", resp.payload_json);
         assert!(!resp.fail_closed);
+        assert!(resp.payload_json.contains("\"jsonrpc\":\"2.0\""));
+
+        let method_only = gateway::mcp::McpRequest {
+            method: "ping".into(),
+            payload_json: "".into(),
+            upstream: None,
+        };
+        let resp = handle_gateway_mcp_request(&|raw| front.accept_mapped(raw), method_only);
+        assert!(resp.ok, "{}", resp.payload_json);
         assert!(resp.payload_json.contains("\"jsonrpc\":\"2.0\""));
 
         let bad = gateway::mcp::McpRequest {
@@ -2686,6 +3103,41 @@ mod tests {
             out.contains("\"tools\"") || out.contains("\"result\""),
             "{out}"
         );
+    }
+
+    #[test]
+    fn accept_with_transport_preserves_auth_hook_context() {
+        let front = McpFront::new(
+            AutoParser,
+            BasicRequestValidator,
+            DefaultToolCallExtractor,
+            HeaderTokenContextProvider,
+            RequireTokenAuthenticator,
+            AllowAllPolicy,
+            CleanTaintTracker,
+            NoApprovalGate,
+            PlaceholderRouter,
+            PlaceholderDispatcher,
+        );
+        let mut transport = TransportMetadata::default();
+        transport
+            .headers
+            .insert("authorization".into(), "Bearer tok".into());
+        let resp = front
+            .accept_with_transport(r#"{"jsonrpc":"2.0","id":"t1","method":"ping"}"#, transport)
+            .expect("authorized");
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn shape_upstream_normalizes_empty_success_to_null_result() {
+        let shaped = ResponseShaper::shape_upstream(McpResponseEnvelope {
+            id: "n".into(),
+            result: None,
+            json_result: None,
+            error: None,
+        });
+        assert_eq!(shaped.to_json_rpc().result, Some(serde_json::Value::Null));
     }
 
     #[test]
@@ -2736,6 +3188,50 @@ mod tests {
         let resp = disp.dispatch(&req).expect("dispatch");
         assert!(resp.error.is_none());
         assert!(resp.json_result.is_some());
+    }
+
+    struct CaptureForwarder {
+        last_payload: Option<String>,
+    }
+    impl mcp_pool::RequestForwarder for CaptureForwarder {
+        fn forward(
+            &mut self,
+            _upstream: &mcp_pool::UpstreamId,
+            request: &mcp_pool::CallRequest,
+        ) -> Result<mcp_pool::CallResponse, mcp_pool::PoolError> {
+            self.last_payload = Some(request.payload.clone());
+            Ok(mcp_pool::CallResponse {
+                payload: r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn shared_pool_forwarder_preserves_raw_jsonrpc_params_and_id() {
+        let fwd = std::sync::Arc::new(std::sync::Mutex::new(CaptureForwarder {
+            last_payload: None,
+        }));
+        let disp = SharedPoolForwarderDispatcher::new(fwd.clone(), "up1");
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "up1".into(),
+                tool_name: None,
+                method: "resources/read".into(),
+            },
+            id: "7".into(),
+            method: "resources/read".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"x"}}"#
+                .into(),
+        };
+        let resp = disp.dispatch(&req).expect("dispatch");
+        assert_eq!(resp.id, "7");
+        let g = fwd.lock().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(g.last_payload.as_ref().expect("payload")).expect("json");
+        assert_eq!(payload["method"], "resources/read");
+        assert_eq!(payload["params"]["uri"], "x");
+        assert_eq!(payload["id"], 7);
     }
 
     #[test]
@@ -2813,5 +3309,491 @@ mod tests {
                 || out.contains("\"id\":2"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn jsonrpc_parse_errors_preserve_request_id_when_mappable() {
+        let front = jsonrpc_front();
+        let resp = front.accept_mapped(r#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#);
+        let err = resp.error.expect("parse error");
+        assert_eq!(err.code, -32700);
+        assert_eq!(resp.id, "7");
+
+        let resp = front.accept_mapped(r#"{"jsonrpc":"2.0","id":"abc","method":123}"#);
+        let err = resp.error.expect("parse error");
+        assert_eq!(err.code, -32700);
+        assert_eq!(resp.id, "abc");
+    }
+
+    #[test]
+    fn auto_parser_rejects_json_batch_fail_closed() {
+        let err = AutoParser
+            .parse(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#)
+            .expect_err("batch rejected");
+        assert!(matches!(err, FrontError::Parse(_)));
+
+        let front = jsonrpc_front();
+        let resp = front.accept_mapped(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
+        let err = resp.error.expect("parse error");
+        assert_eq!(err.code, -32700);
+        assert_eq!(resp.id, "unknown");
+    }
+
+    #[test]
+    fn jsonrpc_parser_rejects_malformed_or_unsupported_shapes_fail_closed() {
+        let err = JsonRpcParser
+            .parse(r#"["not","an","object"]"#)
+            .expect_err("array");
+        assert!(matches!(err, FrontError::Parse(_)));
+
+        let err = JsonRpcParser
+            .parse(r#"{"jsonrpc":"2.0","id":1}"#)
+            .expect_err("missing method");
+        assert!(matches!(err, FrontError::Parse(_)));
+
+        let err = JsonRpcParser
+            .parse(r#"{"jsonrpc":"2.0","id":{"bad":1},"method":"ping"}"#)
+            .expect_err("invalid id type");
+        assert!(matches!(err, FrontError::Parse(_)));
+
+        let err = JsonRpcParser
+            .parse(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"nope"}"#)
+            .expect_err("invalid params");
+        assert!(matches!(err, FrontError::Validation(_)));
+    }
+
+    #[test]
+    fn require_token_front_rejects_missing_authorization_fail_closed() {
+        let front = McpFront::new(
+            AutoParser,
+            BasicRequestValidator,
+            DefaultToolCallExtractor,
+            HeaderTokenContextProvider,
+            RequireTokenAuthenticator,
+            AllowAllPolicy,
+            CleanTaintTracker,
+            NoApprovalGate,
+            PlaceholderRouter,
+            PlaceholderDispatcher,
+        );
+        let resp = front.accept_mapped(r#"{"jsonrpc":"2.0","id":"auth1","method":"ping"}"#);
+        let err = resp.error.expect("auth error");
+        assert_eq!(err.code, -32001);
+        assert_eq!(resp.id, "auth1");
+    }
+
+    #[test]
+    fn pool_dispatch_payload_preserves_raw_params_for_non_tool_methods() {
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "up1".into(),
+                tool_name: None,
+                method: "resources/read".into(),
+            },
+            id: "x".into(),
+            method: "resources/read".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","id":"x","method":"resources/read","params":{"uri":"file://a"}}"#
+                .into(),
+        };
+        let payload = dispatch_pool_jsonrpc_payload(&req);
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(v["params"]["uri"], "file://a");
+        assert_eq!(v["id"], "x");
+    }
+
+    #[test]
+    fn transport_metadata_header_lookup_is_case_insensitive() {
+        let mut t = TransportMetadata::default();
+        t.headers.insert("Mcp-Session-Id".into(), "sess-1".into());
+        t.headers
+            .insert("Authorization".into(), "Bearer tok".into());
+        assert_eq!(t.header("mcp-session-id"), Some("sess-1"));
+        assert_eq!(t.header("authorization"), Some("Bearer tok"));
+    }
+
+    #[test]
+    fn token_context_extracts_mcp_session_header() {
+        let mut req = SkeletonParser.parse("1|ping").expect("parse");
+        req.transport
+            .headers
+            .insert("Mcp-Session-Id".into(), "s42".into());
+        let token = HeaderTokenContextProvider
+            .token_context(&req)
+            .expect("token");
+        assert_eq!(token.session_id.as_deref(), Some("s42"));
+    }
+
+    #[test]
+    fn process_line_suppresses_jsonrpc_notification_response() {
+        let front = jsonrpc_front();
+        let out = process_line(
+            &front,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        );
+        assert!(out.is_none());
+        let out = process_line(&front, r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#);
+        assert!(out.is_some());
+    }
+
+    #[test]
+    fn pool_dispatch_payload_preserves_notification_without_id() {
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "up1".into(),
+                tool_name: None,
+                method: "notifications/initialized".into(),
+            },
+            id: "notification".into(),
+            method: "notifications/initialized".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#.into(),
+        };
+        let payload = dispatch_pool_jsonrpc_payload(&req);
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert!(v.get("id").is_none(), "{payload}");
+        assert_eq!(v["method"], "notifications/initialized");
+    }
+
+    #[test]
+    fn shared_pool_forwarder_uses_routed_target_upstream() {
+        #[derive(Default)]
+        struct CaptureForwarder {
+            seen: Vec<String>,
+        }
+        impl mcp_pool::RequestForwarder for CaptureForwarder {
+            fn forward(
+                &mut self,
+                upstream: &mcp_pool::UpstreamId,
+                request: &mcp_pool::CallRequest,
+            ) -> Result<mcp_pool::CallResponse, mcp_pool::PoolError> {
+                self.seen.push(upstream.0.clone());
+                Ok(mcp_pool::CallResponse {
+                    payload: format!(
+                        r#"{{"jsonrpc":"2.0","id":"1","result":{{"method":"{}"}}}}"#,
+                        request.method
+                    ),
+                })
+            }
+        }
+
+        let fwd = std::sync::Arc::new(std::sync::Mutex::new(CaptureForwarder::default()));
+        let disp = SharedPoolForwarderDispatcher::new(fwd.clone(), "fallback-upstream");
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "routed-upstream".into(),
+                tool_name: Some("echo".into()),
+                method: "tools/call".into(),
+            },
+            id: "1".into(),
+            method: "tools/call".into(),
+            tool_call: Some(ToolCall {
+                name: "echo".into(),
+                arguments: BTreeMap::new(),
+                raw_arguments: Some(serde_json::json!({})),
+            }),
+            raw: r#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"echo","arguments":{}}}"#.into(),
+        };
+        let resp = disp.dispatch(&req).expect("dispatch");
+        assert!(resp.error.is_none(), "{resp:?}");
+        let seen = fwd.lock().unwrap().seen.clone();
+        assert_eq!(seen, vec!["routed-upstream".to_string()]);
+    }
+
+    #[test]
+    fn gateway_bridge_input_propagates_http_auth_and_upstream_hint() {
+        let req = gateway::mcp::McpRequest {
+            method: "".into(),
+            payload_json: r#"{"jsonrpc":"2.0","id":"g","method":"ping"}"#.into(),
+            upstream: Some("pool-a".into()),
+        };
+        let ctx = gateway::mcp::McpHttpContext {
+            authorization: Some("Bearer secret".into()),
+        };
+        let (raw, transport) = gateway_bridge_input(&req, Some(&ctx));
+        assert!(raw.contains("\"ping\""));
+        assert_eq!(transport.header("authorization"), Some("Bearer secret"));
+        assert_eq!(transport.attribute("upstream"), Some("pool-a"));
+    }
+
+    #[test]
+    fn gateway_front_context_bridge_injects_auth_for_require_token_front() {
+        let front = McpFront::new(
+            AutoParser,
+            BasicRequestValidator,
+            DefaultToolCallExtractor,
+            HeaderTokenContextProvider,
+            RequireTokenAuthenticator,
+            AllowAllPolicy,
+            CleanTaintTracker,
+            NoApprovalGate,
+            PlaceholderRouter,
+            PlaceholderDispatcher,
+        );
+        let req = gateway::mcp::McpRequest {
+            method: "ping".into(),
+            payload_json: r#"{"jsonrpc":"2.0","id":"ga","method":"ping"}"#.into(),
+            upstream: None,
+        };
+        let no_ctx = handle_gateway_mcp_with_front_context(&front, req.clone(), None);
+        assert!(!no_ctx.ok);
+        let ctx = gateway::mcp::McpHttpContext {
+            authorization: Some("Bearer ok".into()),
+        };
+        let ok = handle_gateway_mcp_with_front_context(&front, req, Some(&ctx));
+        assert!(ok.ok, "{}", ok.payload_json);
+        assert!(ok.payload_json.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn upstream_hint_router_routes_to_selected_upstream() {
+        let front = McpFront::new(
+            AutoParser,
+            BasicRequestValidator,
+            DefaultToolCallExtractor,
+            HeaderTokenContextProvider,
+            PlaceholderAuthenticator,
+            AllowAllPolicy,
+            CleanTaintTracker,
+            NoApprovalGate,
+            UpstreamHintRouter,
+            PlaceholderDispatcher,
+        );
+        let req = gateway::mcp::McpRequest {
+            method: "".into(),
+            payload_json: r#"{"jsonrpc":"2.0","id":"u1","method":"tools/call","params":{"name":"echo","arguments":{}}}"#.into(),
+            upstream: Some("upstream-x".into()),
+        };
+        let resp = handle_gateway_mcp_with_front_context(&front, req, None);
+        assert!(resp.ok, "{}", resp.payload_json);
+        assert!(
+            resp.payload_json.contains("routed:upstream-x:echo"),
+            "{}",
+            resp.payload_json
+        );
+    }
+
+    #[test]
+    fn accept_mapped_with_transport_applies_auth_context() {
+        let front = McpFront::new(
+            AutoParser,
+            BasicRequestValidator,
+            DefaultToolCallExtractor,
+            HeaderTokenContextProvider,
+            RequireTokenAuthenticator,
+            AllowAllPolicy,
+            CleanTaintTracker,
+            NoApprovalGate,
+            PlaceholderRouter,
+            PlaceholderDispatcher,
+        );
+        let mut transport = TransportMetadata::default();
+        transport
+            .headers
+            .insert("authorization".into(), "Bearer mapped".into());
+        let resp = front.accept_mapped_with_transport(
+            r#"{"jsonrpc":"2.0","id":"m","method":"ping"}"#,
+            transport,
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.to_json_rpc().id, JsonRpcId::Str("m".into()));
+    }
+
+    #[test]
+    fn pool_dispatch_preserves_tools_call_payload_and_upstream_error() {
+        #[derive(Default)]
+        struct Capture {
+            last_payload: Option<String>,
+            last_upstream: Option<String>,
+        }
+        impl mcp_pool::RequestForwarder for Capture {
+            fn forward(
+                &mut self,
+                upstream: &mcp_pool::UpstreamId,
+                request: &mcp_pool::CallRequest,
+            ) -> Result<mcp_pool::CallResponse, mcp_pool::PoolError> {
+                self.last_payload = Some(request.payload.clone());
+                self.last_upstream = Some(upstream.0.clone());
+                Ok(mcp_pool::CallResponse {
+                    payload: r#"{"jsonrpc":"2.0","id":"c1","error":{"code":-32099,"message":"upstream boom","data":{"x":1}}}"#.into(),
+                })
+            }
+        }
+
+        let fwd = std::sync::Arc::new(std::sync::Mutex::new(Capture::default()));
+        let disp = SharedPoolForwarderDispatcher::new(fwd.clone(), "fallback");
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "pool-z".into(),
+                tool_name: Some("sum".into()),
+                method: "tools/call".into(),
+            },
+            id: "c1".into(),
+            method: "tools/call".into(),
+            tool_call: Some(ToolCall {
+                name: "sum".into(),
+                arguments: BTreeMap::from([("a".into(), "1".into())]),
+                raw_arguments: Some(serde_json::json!({"a": 1, "b": 2})),
+            }),
+            raw: r#"{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"sum","arguments":{"a":1,"b":2}}}"#.into(),
+        };
+        let resp = disp.dispatch(&req).expect("dispatch");
+        assert_eq!(resp.id, "c1");
+        let err = resp.error.as_ref().expect("upstream error preserved");
+        assert_eq!(err.code, -32099);
+        assert_eq!(err.message, "upstream boom");
+        assert_eq!(err.data, Some(serde_json::json!({"x":1})));
+        let j = resp.to_json_rpc();
+        assert_eq!(j.error.as_ref().unwrap().code, -32099);
+
+        let g = fwd.lock().unwrap();
+        assert_eq!(g.last_upstream.as_deref(), Some("pool-z"));
+        let payload: serde_json::Value =
+            serde_json::from_str(g.last_payload.as_deref().unwrap()).expect("json");
+        assert_eq!(payload["jsonrpc"], "2.0");
+        assert_eq!(payload["id"], "c1");
+        assert_eq!(payload["method"], "tools/call");
+        assert_eq!(payload["params"]["name"], "sum");
+        assert_eq!(payload["params"]["arguments"]["a"], 1);
+        assert_eq!(payload["params"]["arguments"]["b"], 2);
+    }
+
+    #[test]
+    fn pool_dispatch_preserves_initialize_and_tools_list_for_proxy() {
+        #[derive(Default)]
+        struct Capture {
+            payloads: Vec<String>,
+        }
+        impl mcp_pool::RequestForwarder for Capture {
+            fn forward(
+                &mut self,
+                _upstream: &mcp_pool::UpstreamId,
+                request: &mcp_pool::CallRequest,
+            ) -> Result<mcp_pool::CallResponse, mcp_pool::PoolError> {
+                self.payloads.push(request.payload.clone());
+                let v: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+                let id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                Ok(mcp_pool::CallResponse {
+                    payload: serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
+                        .to_string(),
+                })
+            }
+        }
+
+        let fwd = std::sync::Arc::new(std::sync::Mutex::new(Capture::default()));
+        let disp = SharedPoolForwarderDispatcher::new(fwd.clone(), "pool-a");
+
+        let init_req = DispatchRequest {
+            target: UpstreamTarget { upstream_id: "pool-a".into(), tool_name: None, method: "initialize".into() },
+            id: "init-1".into(),
+            method: "initialize".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","id":"init-1","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#.into(),
+        };
+        let resp = disp.dispatch(&init_req).expect("init");
+        assert!(resp.error.is_none(), "{resp:?}");
+        assert_eq!(resp.to_json_rpc().id, JsonRpcId::Str("init-1".into()));
+
+        let list_req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "pool-a".into(),
+                tool_name: None,
+                method: "tools/list".into(),
+            },
+            id: "list-1".into(),
+            method: "tools/list".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","id":"list-1","method":"tools/list","params":{}}"#.into(),
+        };
+        let resp = disp.dispatch(&list_req).expect("list");
+        assert!(resp.error.is_none(), "{resp:?}");
+
+        let payloads = fwd.lock().unwrap().payloads.clone();
+        assert_eq!(payloads.len(), 2);
+        let init: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(init["method"], "initialize");
+        assert_eq!(init["params"]["protocolVersion"], "2025-03-26");
+        assert_eq!(init["params"]["clientInfo"]["name"], "c");
+        let list: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+        assert_eq!(list["method"], "tools/list");
+        assert_eq!(list["id"], "list-1");
+    }
+
+    #[test]
+    fn decode_pool_forward_response_normalizes_lenient_and_fails_closed() {
+        // Lenient JSON-RPC-ish response without jsonrpc field, null id mapped to request id.
+        let resp = decode_pool_forward_response(
+            "req-1",
+            r#"{"id":null,"error":{"code":-32000,"message":"boom","data":{"k":"v"}}}"#,
+        );
+        assert_eq!(resp.id, "req-1");
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, -32000);
+        assert_eq!(err.message, "boom");
+        assert_eq!(err.data, Some(serde_json::json!({"k":"v"})));
+
+        // Success result preserved.
+        let resp = decode_pool_forward_response(
+            "req-2",
+            r#"{"jsonrpc":"2.0","id":"up","result":{"tools":[]}}"#,
+        );
+        assert_eq!(resp.id, "up");
+        assert_eq!(resp.json_result, Some(serde_json::json!({"tools": []})));
+
+        for (label, payload) in [
+            ("empty", "   "),
+            ("non-json", "not-json"),
+            ("non-object", "[1,2,3]"),
+            ("missing result/error", r#"{"jsonrpc":"2.0","id":"x"}"#),
+            ("invalid error shape", r#"{"id":"x","error":"boom"}"#),
+            (
+                "missing error code",
+                r#"{"id":"x","error":{"message":"m"}}"#,
+            ),
+            ("invalid id type", r#"{"id":{"bad":1},"result":{}}"#),
+        ] {
+            let resp = decode_pool_forward_response("req-x", payload);
+            let err = resp
+                .error
+                .unwrap_or_else(|| panic!("{label}: expected error"));
+            assert_eq!(err.code, FrontError::Dispatch("x".into()).code(), "{label}");
+            assert!(resp.json_result.is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn shared_pool_forwarder_fail_closed_on_malformed_upstream_payload() {
+        struct BadForwarder;
+        impl mcp_pool::RequestForwarder for BadForwarder {
+            fn forward(
+                &mut self,
+                _upstream: &mcp_pool::UpstreamId,
+                _request: &mcp_pool::CallRequest,
+            ) -> Result<mcp_pool::CallResponse, mcp_pool::PoolError> {
+                Ok(mcp_pool::CallResponse {
+                    payload: r#"{"unexpected":"shape"}"#.into(),
+                })
+            }
+        }
+
+        let fwd = std::sync::Arc::new(std::sync::Mutex::new(BadForwarder));
+        let disp = SharedPoolForwarderDispatcher::new(fwd, "pool-a");
+        let req = DispatchRequest {
+            target: UpstreamTarget {
+                upstream_id: "pool-a".into(),
+                tool_name: None,
+                method: "ping".into(),
+            },
+            id: "p1".into(),
+            method: "ping".into(),
+            tool_call: None,
+            raw: r#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#.into(),
+        };
+        let resp = disp.dispatch(&req).expect("mapped dispatch result");
+        let err = resp
+            .error
+            .expect("fail-closed on malformed upstream payload");
+        assert_eq!(err.code, -32000);
+        assert_eq!(resp.id, "p1");
     }
 }

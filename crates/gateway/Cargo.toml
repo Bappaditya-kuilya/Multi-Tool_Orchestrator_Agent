@@ -23,9 +23,9 @@ hex.workspace = true
 mcp-pool = { path = "../mcp-pool" }
 serde.workspace = true
 serde_json.workspace = true
-store = { path = "../store" }
+store = { path = "../store", features = ["postgres-sqlx"] }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.8"
 tower.workspace = true
@@ -34,4 +34,4 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
