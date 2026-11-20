@@ -3,7 +3,8 @@
 
 Runs bench pytest suite (or reads existing JUnit XML) and emits CI-style
 summary/table output in markdown and/or JSON. Includes latency/overhead
-measurements/placeholders and optional CI thresholds.
+measurements/placeholders, run/mode/gateway metadata, explicit xfail reasons,
+and optional CI thresholds.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -174,15 +176,75 @@ def _class_counts(summary: SuiteSummary) -> dict[str, dict[str, int]]:
     return by
 
 
-def render_readme_table(summary: SuiteSummary, rc: int) -> str:
+def _xfail_cases(summary: SuiteSummary) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for c in summary.cases:
+        if c.outcome in ("xfail", "xpass"):
+            out.append(
+                {
+                    "name": c.name,
+                    "class": c.attack_class,
+                    "outcome": c.outcome,
+                    "reason": c.message or "",
+                }
+            )
+    return out
+
+
+def _run_context(args: argparse.Namespace | None = None) -> dict[str, Any]:
+    mode = (getattr(args, "bench_mode", None) if args else None) or os.getenv("SCOPEGATE_BENCH_MODE", "baseline")
+    gateway_url = (getattr(args, "gateway_url", None) if args else None)
+    if gateway_url is None:
+        gateway_url = os.getenv("SCOPEGATE_GATEWAY_URL", "")
+    gateway_url = str(gateway_url or "").strip()
+    ctx: dict[str, Any] = {
+        "bench_mode": mode,
+        "gateway_url": gateway_url or None,
+        "gateway_configured": bool(gateway_url),
+        "gateway_reachable": None,
+        "gateway_probe": "not_checked",
+    }
+    if gateway_url:
+        try:
+            bench_dir = Path(__file__).resolve().parent
+            if str(bench_dir) not in sys.path:
+                sys.path.insert(0, str(bench_dir))
+            from harness import gateway_env_summary  # type: ignore
+
+            g = gateway_env_summary(gateway_url)
+            ctx["gateway_reachable"] = g.get("reachable")
+            ctx["gateway_probe"] = g.get("probe")
+        except Exception as e:
+            ctx["gateway_probe"] = f"probe_error:{e}"
+    else:
+        ctx["gateway_probe"] = "not_configured"
+    # expected baseline evidence semantics (documented)
+    ctx["expected_baseline"] = "non-live baseline: 38 passed, 7 xfailed; live-configured runs may pass reachable/enforced live integration cases"
+    return ctx
+
+
+def render_readme_table(summary: SuiteSummary, rc: int, run_ctx: dict[str, Any] | None = None) -> str:
     """Compact markdown table format suitable for pasting into README/docs."""
+    run_ctx = run_ctx or {}
     status = "PASS" if rc == 0 and summary.ok else "FAIL"
+    mode = run_ctx.get("bench_mode", "unknown")
+    gw_url = run_ctx.get("gateway_url") or "(none)"
+    gw_cfg = "yes" if run_ctx.get("gateway_configured") else "no"
+    gw_reach = run_ctx.get("gateway_reachable")
+    gw_probe = run_ctx.get("gateway_probe", "")
     lines = []
-    lines.append(f"<!-- bench:status={status} tests={summary.tests} passed={summary.passed} xfailed={summary.xfailed} failures={summary.failures} errors={summary.errors} rc={rc} -->")
+    lines.append(
+        f"<!-- bench:status={status} mode={mode} gateway_configured={gw_cfg} tests={summary.tests} "
+        f"passed={summary.passed} xfailed={summary.xfailed} failures={summary.failures} errors={summary.errors} rc={rc} -->"
+    )
     lines.append("")
     lines.append("| Metric | Value |")
     lines.append("|---|---:|")
     lines.append(f"| Status | {status} |")
+    lines.append(f"| Bench mode | {mode} |")
+    lines.append(f"| Gateway URL | {gw_url} |")
+    lines.append(f"| Gateway configured | {gw_cfg} |")
+    lines.append(f"| Gateway reachable/probe | {gw_reach} ({gw_probe}) |")
     lines.append(f"| Tests | {summary.tests} |")
     lines.append(f"| Passed | {summary.passed} |")
     lines.append(f"| XFailed (gateway-dependent) | {summary.xfailed} |")
@@ -202,6 +264,13 @@ def render_readme_table(summary: SuiteSummary, rc: int) -> str:
         lines.append(
             f"| {cls} | {d['total']} | {d['pass']} | {d['xfail']} | {bad} | {d['skip']} |"
         )
+    xfails = _xfail_cases(summary)
+    if xfails:
+        lines.append("")
+        lines.append("**XFail reasons (gateway-dependent/live-unconfigured):**")
+        for x in xfails:
+            reason = (x.get("reason") or "").replace("\n", " ").strip()
+            lines.append(f"- `{x['name']}` [{x['class']}]: {reason}")
     lines.append("")
     return "\n".join(lines)
 
@@ -229,9 +298,16 @@ def _latency_stats(summary: SuiteSummary) -> dict[str, Any]:
     }
 
 
-def render_markdown(summary: SuiteSummary, rc: int, thresholds: dict[str, Any] | None = None, instrumented: dict[str, Any] | None = None) -> str:
+def render_markdown(
+    summary: SuiteSummary,
+    rc: int,
+    thresholds: dict[str, Any] | None = None,
+    instrumented: dict[str, Any] | None = None,
+    run_ctx: dict[str, Any] | None = None,
+) -> str:
     thresholds = thresholds or {}
     instrumented = instrumented or {}
+    run_ctx = run_ctx or {}
     lat = _latency_stats(summary)
     lines = []
     status = "PASS" if rc == 0 and summary.ok else "FAIL"
@@ -243,12 +319,21 @@ def render_markdown(summary: SuiteSummary, rc: int, thresholds: dict[str, Any] |
         f"xpassed={summary.xpassed} time={summary.time_s:.3f}s rc={rc}"
     )
     lines.append("")
+    lines.append("## Run context (mode/gateway)")
+    lines.append("")
+    lines.append(f"- bench_mode: `{run_ctx.get('bench_mode', 'unknown')}` (baseline|dryrun|enforce; live cases require configured gateway)")
+    lines.append(f"- gateway_url: `{run_ctx.get('gateway_url') or '(not configured)'}`")
+    lines.append(f"- gateway_configured: `{run_ctx.get('gateway_configured', False)}`")
+    lines.append(f"- gateway_reachable: `{run_ctx.get('gateway_reachable')}`")
+    lines.append(f"- gateway_probe: `{run_ctx.get('gateway_probe', '')}`")
+    lines.append(f"- expected_baseline: {run_ctx.get('expected_baseline', '')}")
+    lines.append("")
     if thresholds:
         lines.append(f"**Thresholds:** {json.dumps(thresholds, sort_keys=True)}")
         lines.append("")
     lines.append("## README table format")
     lines.append("")
-    lines.append(render_readme_table(summary, rc).rstrip())
+    lines.append(render_readme_table(summary, rc, run_ctx=run_ctx).rstrip())
     lines.append("")
     by = _class_counts(summary)
     lines.append("## By attack class")
@@ -262,6 +347,18 @@ def render_markdown(summary: SuiteSummary, rc: int, thresholds: dict[str, Any] |
         lines.append(
             f"| {cls} | {d['total']} | {d['pass']} | {d['fail']} | {d['error']} | {d['xfail']} | {d['xpass']} | {d['skip']} |"
         )
+    lines.append("")
+    xfails = _xfail_cases(summary)
+    lines.append("## XFailed cases (gateway-dependent / live-unconfigured)")
+    lines.append("")
+    if xfails:
+        lines.append("| Case | Class | Outcome | Reason (why xfailed) |")
+        lines.append("|---|---|---|---|")
+        for x in xfails:
+            reason = (x.get("reason") or "").replace("\n", " ").replace("|", "/").strip()
+            lines.append(f"| `{x['name']}` | {x['class']} | {x['outcome']} | {reason} |")
+    else:
+        lines.append("_No xfailed/xpassed cases in this run._")
     lines.append("")
     lines.append("## Cases")
     lines.append("")
@@ -334,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Stdout format: full CI markdown (default) or compact README table block",
     )
     ap.add_argument("--latency-json", help="Read instrumented latency artifact JSON (from BENCH_LATENCY_OUT)")
+    ap.add_argument("--bench-mode", help="Bench mode metadata for report (default: $SCOPEGATE_BENCH_MODE or baseline)")
+    ap.add_argument("--gateway-url", help="Gateway URL/config context for report (default: $SCOPEGATE_GATEWAY_URL)")
     ap.add_argument("--max-failures", type=int, default=None, help="CI threshold: fail if failures exceed value")
     ap.add_argument("--max-errors", type=int, default=None, help="CI threshold: fail if errors exceed value")
     ap.add_argument("--max-xpassed", type=int, default=0, help="CI threshold: fail if xpassed exceed value (default 0)")
@@ -355,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             junit_path = Path(td) / "bench-junit.xml"
             rc, summary = run_pytest(pytest_args, junit_path)
 
+    run_ctx = _run_context(args)
     instrumented: dict[str, Any] = {}
     if getattr(args, "latency_json", None):
         try:
@@ -381,13 +481,16 @@ def main(argv: list[str] | None = None) -> int:
         "instrumented": instrumented,
         "note": "Latency/overhead from JUnit case durations; instrumented records from harness TimingRecord export when provided.",
     }
-    ci_md = render_markdown(summary, rc, thresholds=thresholds, instrumented=instrumented if isinstance(instrumented, dict) else {})
-    readme_md = render_readme_table(summary, rc)
+    ci_md = render_markdown(summary, rc, thresholds=thresholds, instrumented=instrumented if isinstance(instrumented, dict) else {}, run_ctx=run_ctx)
+    readme_md = render_readme_table(summary, rc, run_ctx=run_ctx)
     out = readme_md if args.format == "readme-table" else ci_md
+    xfail_cases = _xfail_cases(summary)
     report: dict[str, Any] = {
         "suite": "bench",
+        "run_context": run_ctx,
         "summary": {k: v for k, v in asdict(summary).items() if k != "cases"},
         "cases": [asdict(c) for c in summary.cases],
+        "xfail_cases": xfail_cases,
         "returncode": rc,
         "thresholds": thresholds,
         "latency_ms_placeholders": timing,

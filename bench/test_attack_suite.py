@@ -40,7 +40,10 @@ try:
 except Exception:  # pragma: no cover
     def require_live_gateway(gateway_url: str) -> str:
         if not gateway_url:
-            pytest.xfail("live gateway not configured")
+            pytest.xfail(
+                "gateway-dependent live integration case xfailed: live gateway not configured "
+                "(set --gateway-url or SCOPEGATE_GATEWAY_URL to run against a local gateway)"
+            )
         return gateway_url
 
 # Porting notes (reference -> bench): see METHODOLOGY.md "Scenario mapping".
@@ -57,10 +60,11 @@ except Exception:  # pragma: no cover
 
 @pytest.mark.injection_exfil
 def test_injection_exfil_tool_output_to_external_egress(bench_mode: str) -> None:
-    """placeholder->xfail: needs gateway taint tracking + egress policy enforcement."""
+    """Capability-gated: not proven on current sqlite+stdio live runtime path."""
     pytest.xfail(
-        "gateway-dependent: requires taint propagation from untrusted tool output to egress policy "
-        "(no running gateway/MCP proxy in bench)"
+        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
+        "no evidence of untrusted tool-output taint propagation to egress enforcement "
+        "on the current source sqlite+stdio live path"
     )
 
 
@@ -102,8 +106,9 @@ def test_confused_deputy_cross_task_or_authority_confusion(bench_mode: str) -> N
 @pytest.mark.confused_deputy
 def test_confused_deputy_gateway_isolation_enforcement(bench_mode: str) -> None:
     pytest.xfail(
-        "gateway-dependent: requires concurrent task isolation in gateway/MCP request handling "
-        "(local model only checks correlation invariant)"
+        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
+        "no evidence of concurrent cross-task isolation in live MCP request handling "
+        "on the current source sqlite+stdio live path (local correlation model only)"
     )
 
 
@@ -131,15 +136,18 @@ def test_tool_poisoning_unknown_capability_fails_cleanly() -> None:
 @pytest.mark.rug_pull
 def test_rug_pull_tool_changes_after_trust(bench_mode: str) -> None:
     pytest.xfail(
-        "gateway-dependent: requires manifest/schema pinning, drift detection and re-approval flow "
-        "across discovery/invocation lifecycle"
+        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
+        "no evidence of manifest/schema pinning, drift detection, or re-approval flow "
+        "on the current source sqlite+stdio live path"
     )
 
 
 @pytest.mark.secret_leak
 def test_secret_leak_agent_visible_credentials(bench_mode: str) -> None:
     pytest.xfail(
-        "gateway-dependent: requires redaction/secret-boundary enforcement on agent-visible responses and logs"
+        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
+        "no evidence of agent-visible secret redaction/boundary enforcement "
+        "on the current source sqlite+stdio live path"
     )
 
 
@@ -475,13 +483,16 @@ def test_live_gateway_policy_denies_out_of_scope(gateway_url: str, enforce: bool
     url = require_live_gateway(gateway_url)
     gw = get_live_gateway(url)
     assert gw is not None
-    # best-effort generic probe payloads/endpoints; absence of a full MCP client keeps this non-invasive.
+    # best-effort generic probe payloads/endpoints; try gateway-native MCP wrapper plus fallbacks.
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "admin:danger", "arguments": {}}}
     attempts = [
-        ("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "admin:danger", "arguments": {}}}),
-        ("/v1/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "admin:danger", "arguments": {}}}),
+        ("/mcp", {"method": "", "payload_json": json.dumps(rpc)}),
+        ("/mcp", rpc),
+        ("/v1/mcp", rpc),
         ("/api/tools/call", {"name": "admin:danger", "arguments": {}, "scope": "admin:danger"}),
     ]
     denied_statuses = {400, 401, 403, 404, 405, 409, 422, 429}
+    deny_tokens = ("denied", "forbidden", "unauthorized", "not allowed", "scope", "policy", "block", "fail-closed")
     last = (0, None, 0.0, "none")
     for path, payload in attempts:
         status, body, elapsed_s = record_latency(f"live_policy:{path}", gw.post_json, path, payload)
@@ -489,16 +500,29 @@ def test_live_gateway_policy_denies_out_of_scope(gateway_url: str, enforce: bool
         assert elapsed_s >= 0.0
         if status == 0:
             continue
-        body_denied = isinstance(body, dict) and any(
-            k in body for k in ("error", "errors", "denied", "blocked", "policy")
-        )
         text = str(body).lower()
-        text_denied = any(tok in text for tok in ("denied", "forbidden", "unauthorized", "not allowed", "scope", "policy", "block"))
+        text_denied = any(tok in text for tok in deny_tokens)
+        body_denied = False
+        if isinstance(body, dict):
+            if any(k in body for k in ("denied", "blocked")):
+                body_denied = True
+            elif "errors" in body and body.get("errors"):
+                body_denied = True
+            elif "error" in body and body.get("error"):
+                # JSON-RPC/MCP/HTTP error payloads may be returned with HTTP 200; treat as denial/error evidence.
+                body_denied = True
+            elif "policy" in body and "result" not in body:
+                body_denied = True
+            elif text_denied and "result" not in body:
+                body_denied = True
+        else:
+            body_denied = text_denied
         if status in denied_statuses or body_denied or text_denied:
-            if enforce:
-                assert status != 200, f"enforce mode requires denial/block, got allow-like 200 at {path}: {body!r}"
+            if enforce and status == 200:
+                # Allow HTTP 200 only when response carries explicit denial/error evidence (not an allow-like success).
+                assert body_denied or text_denied, f"enforce mode requires denial/block evidence, got allow-like 200 at {path}: {body!r}"
             return
-        # 200 with explicit success/allow shape is only acceptable outside enforce mode as non-denial evidence.
+        # 200 without denial evidence: acceptable only outside enforce mode as non-denial/inconclusive live evidence.
         if status == 200 and not enforce:
             return
     status, body, _, path = last

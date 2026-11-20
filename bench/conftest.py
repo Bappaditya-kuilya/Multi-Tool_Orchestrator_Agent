@@ -79,7 +79,10 @@ def record_latency(latency_records: list[TimingRecord]) -> Callable[[str, Callab
 
 def require_live_gateway(gateway_url: str) -> str:
     if not gateway_url:
-        pytest.xfail("live gateway not configured (set --gateway-url or SCOPEGATE_GATEWAY_URL)")
+        pytest.xfail(
+            "gateway-dependent live integration case xfailed: live gateway not configured "
+            "(set --gateway-url or SCOPEGATE_GATEWAY_URL to run against a local gateway)"
+        )
     return gateway_url
 
 

@@ -23,21 +23,53 @@ python3 bench/report.py \
   --latency-json "$OUT_DIR/bench-latency.json" \
   --json "$OUT_DIR/bench-summary.json" \
   --md "$OUT_DIR/bench-report.md" \
+  --bench-mode "$MODE" \
+  --gateway-url "${SCOPEGATE_GATEWAY_URL:-}" \
   --max-failures 0 --max-errors 0 --max-xpassed 0 \
   --format ci
 REPORT_RC=$?
 set -e
-python3 bench/report.py --junitxml "$OUT_DIR/bench-junit.xml" --format readme-table > "$OUT_DIR/bench-readme-table.md" || true
+python3 bench/report.py \
+  --junitxml "$OUT_DIR/bench-junit.xml" \
+  --bench-mode "$MODE" \
+  --gateway-url "${SCOPEGATE_GATEWAY_URL:-}" \
+  --format readme-table > "$OUT_DIR/bench-readme-table.md" || true
 
-cat > "$OUT_DIR/bench-ci-env.json" <<EOF
-{
-  "mode": "$MODE",
-  "gateway_url": "${SCOPEGATE_GATEWAY_URL:-}",
-  "gateway_configured": $( [[ -n "${SCOPEGATE_GATEWAY_URL:-}" ]] && echo true || echo false ),
-  "pytest_rc": $PYTEST_RC,
-  "report_rc": $REPORT_RC
+python3 - "$OUT_DIR/bench-ci-env.json" "$MODE" "${SCOPEGATE_GATEWAY_URL:-}" "$PYTEST_RC" "$REPORT_RC" "$ROOT" <<'PY'
+import json, os, platform, subprocess, sys
+from datetime import datetime, timezone
+
+out, mode, gw_url, pytest_rc, report_rc, root = sys.argv[1:7]
+sys.path.insert(0, os.path.join(root, "bench"))
+ctx = {
+    "mode": mode,
+    "gateway_url": gw_url or None,
+    "gateway_configured": bool(gw_url),
+    "pytest_rc": int(pytest_rc),
+    "report_rc": int(report_rc),
+    "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "cwd": os.getcwd(),
+    "python": sys.version.split()[0],
+    "platform": platform.platform(),
 }
-EOF
+try:
+    ctx["commit"] = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+    ctx["commit_short"] = subprocess.check_output(["git", "-C", root, "rev-parse", "--short", "HEAD"], text=True).strip()
+except Exception:
+    ctx["commit"] = None
+    ctx["commit_short"] = None
+try:
+    from harness import gateway_env_summary
+    g = gateway_env_summary(gw_url)
+    ctx.update(g)
+    ctx["mode"] = mode  # explicit run mode
+except Exception as e:
+    ctx["gateway_env_error"] = str(e)
+ctx["expected_baseline"] = "non-live baseline: 38 passed, 7 xfailed; live-configured runs may pass reachable/enforced live integration cases"
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(ctx, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
 
 echo "CI artifacts written to $OUT_DIR"
 ls -1 "$OUT_DIR"
