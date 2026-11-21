@@ -60,11 +60,13 @@ except Exception:  # pragma: no cover
 
 @pytest.mark.injection_exfil
 def test_injection_exfil_tool_output_to_external_egress(bench_mode: str) -> None:
-    """Capability-gated: not proven on current sqlite+stdio live runtime path."""
+    """Gateway MCP handler enforces taint propagation/persistence; live stdio+sqlite E2E harness not wired."""
     pytest.xfail(
-        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
-        "no evidence of untrusted tool-output taint propagation to egress enforcement "
-        "on the current source sqlite+stdio live path"
+        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
+        "gateway MCP handler now marks tools/call output as UntrustedContent, "
+        "persists/merges session taint snapshots (task_id/token/principal key), "
+        "and fail-closes on taint store read/write errors before egress/policy eval; "
+        "see crates/gateway/src/mcp.rs tests for enforcement evidence"
     )
 
 
@@ -106,9 +108,13 @@ def test_confused_deputy_cross_task_or_authority_confusion(bench_mode: str) -> N
 @pytest.mark.confused_deputy
 def test_confused_deputy_gateway_isolation_enforcement(bench_mode: str) -> None:
     pytest.xfail(
-        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
-        "no evidence of concurrent cross-task isolation in live MCP request handling "
-        "on the current source sqlite+stdio live path (local correlation model only)"
+        "gateway-dependent xfail (concurrent isolation not proven; request-binding guards enforced): "
+        "gateway MCP handler is serialized by a global AppState lock in server.rs, so concurrent "
+        "cross-task interleaving on the live MCP path is not exercised. Handler logic now has "
+        "explicit per-request binding tests proving JSON-RPC id/task_id/approval/task context "
+        "are request-local and not mixed across sequential requests on shared state; "
+        "see crates/gateway/src/mcp.rs isolation tests. True concurrent multi-request isolation "
+        "remains unproven until the global lock is narrowed/replaced with concurrent dispatch proof."
     )
 
 
@@ -135,19 +141,24 @@ def test_tool_poisoning_unknown_capability_fails_cleanly() -> None:
 
 @pytest.mark.rug_pull
 def test_rug_pull_tool_changes_after_trust(bench_mode: str) -> None:
+    """Gateway MCP handler enforces tool-manifest pinning on tools/list; live stdio+sqlite E2E harness not wired."""
     pytest.xfail(
-        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
-        "no evidence of manifest/schema pinning, drift detection, or re-approval flow "
-        "on the current source sqlite+stdio live path"
+        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
+        "gateway MCP tools/list now pins tool descriptors (name, description, inputSchema hash) "
+        "in the durable store, records first-seen approved baselines, and fail-closes on "
+        "descriptor drift, unapproved pins, or pin store read/write errors with explicit "
+        "re-approval-required denial; see crates/gateway/src/mcp.rs and crates/store/src/lib.rs tests"
     )
 
 
 @pytest.mark.secret_leak
 def test_secret_leak_agent_visible_credentials(bench_mode: str) -> None:
+    """Gateway MCP handler redacts agent-visible secret markers; live stdio+sqlite E2E harness not wired."""
     pytest.xfail(
-        "gateway-dependent xfail (capability not enforced/proven in current runtime): "
-        "no evidence of agent-visible secret redaction/boundary enforcement "
-        "on the current source sqlite+stdio live path"
+        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
+        "gateway MCP handler now scrubs/redacts obvious secret markers from agent-visible "
+        "MCP responses/errors and fail-closes if redaction cannot be safely applied; "
+        "see crates/gateway/src/mcp.rs tests for enforcement evidence"
     )
 
 

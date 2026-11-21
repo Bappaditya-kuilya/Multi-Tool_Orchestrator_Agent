@@ -313,6 +313,21 @@ impl TaintSnapshotQuery {
     }
 }
 
+/// Durable tool-manifest pin record for MCP tools/list drift detection.
+/// Keyed by (upstream_id, tool_name). Fail-closed on read/write errors.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ToolPinRecord {
+    pub upstream_id: String,
+    pub tool_name: String,
+    /// Deterministic hash over canonical tool descriptor (name, description, inputSchema).
+    pub descriptor_hash: String,
+    /// Canonical JSON descriptor used for hashing/debugging.
+    pub descriptor_json: String,
+    pub first_seen_at: String,
+    /// Approved baseline; drift requires explicit re-approval flow (not yet automated).
+    pub approved: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalQuery {
     pub task_id: Option<String>,
@@ -359,8 +374,19 @@ impl TaintSnapshotHook for NoopTaintSnapshotHook {}
 #[async_trait]
 pub trait Store: Send + Sync {
     fn backend(&self) -> BackendKind;
+    /// Append an audit event with append-before-return semantics.
+    ///
+    /// Implementations MUST persist the event durably (when durable) and commit
+    /// before returning `Ok`. On any write/validation/tail-drift failure, return
+    /// `Err` (fail-closed); callers must not treat the action as audited.
     async fn append_audit_event(&self, event: AuditEvent) -> StoreResult<AuditEvent>;
     async fn query_audit(&self, query: AuditQuery) -> StoreResult<Vec<AuditEvent>>;
+    /// Verify audit hash-chain integrity.
+    ///
+    /// Fail-closed contract: if `fail_closed_on_audit_error` is enabled and the
+    /// chain is invalid, implementations MUST return `Err(StoreError::Integrity(_))`.
+    /// When fail-closed is disabled, implementations may return `Ok(report)` with
+    /// `ok=false` for diagnostic/reporting flows.
     async fn verify_audit_chain(&self) -> StoreResult<AuditVerificationReport>;
     async fn create_approval(&self, approval: ApprovalRecord) -> StoreResult<ApprovalRecord>;
     async fn get_approval(&self, id: &str) -> StoreResult<Option<ApprovalRecord>>;
@@ -387,6 +413,12 @@ pub trait Store: Send + Sync {
         &self,
         query: TaintSnapshotQuery,
     ) -> StoreResult<Vec<TaintSnapshotRecord>>;
+    async fn get_tool_pin(
+        &self,
+        upstream_id: &str,
+        tool_name: &str,
+    ) -> StoreResult<Option<ToolPinRecord>>;
+    async fn upsert_tool_pin(&self, record: ToolPinRecord) -> StoreResult<ToolPinRecord>;
     async fn health_check(&self) -> StoreResult<()>;
 }
 
@@ -460,6 +492,16 @@ impl Store for UnimplementedStore {
         _query: TaintSnapshotQuery,
     ) -> StoreResult<Vec<TaintSnapshotRecord>> {
         Err(StoreError::NotImplemented("list_taint_snapshots"))
+    }
+    async fn get_tool_pin(
+        &self,
+        _upstream_id: &str,
+        _tool_name: &str,
+    ) -> StoreResult<Option<ToolPinRecord>> {
+        Err(StoreError::NotImplemented("get_tool_pin"))
+    }
+    async fn upsert_tool_pin(&self, _record: ToolPinRecord) -> StoreResult<ToolPinRecord> {
+        Err(StoreError::NotImplemented("upsert_tool_pin"))
     }
     async fn health_check(&self) -> StoreResult<()> {
         Err(StoreError::NotImplemented("health_check"))
@@ -559,6 +601,7 @@ struct InMemoryState {
     policies: HashMap<String, PolicyRecord>,
     revocations: HashMap<String, RevocationRecord>,
     taint_snapshots: HashMap<String, TaintSnapshotRecord>,
+    tool_pins: HashMap<String, ToolPinRecord>,
     next_seq: i64,
 }
 
@@ -600,10 +643,6 @@ impl InMemoryStore {
             .lock()
             .map_err(|_| StoreError::Unavailable("mutex poisoned".into()))
     }
-
-    fn compute_hash(ev: &AuditEvent) -> Vec<u8> {
-        compute_audit_hash(ev)
-    }
 }
 
 impl Default for InMemoryStore {
@@ -622,15 +661,14 @@ impl Store for InMemoryStore {
         BackendKind::InMemory
     }
 
-    async fn append_audit_event(&self, mut event: AuditEvent) -> StoreResult<AuditEvent> {
-        event.validate_for_append()?;
+    async fn append_audit_event(&self, event: AuditEvent) -> StoreResult<AuditEvent> {
         let mut st = self.lock()?;
+        let prev_hash = st.audit.last().and_then(|e| e.hash.clone());
         let seq = st.next_seq;
-        st.next_seq += 1;
-        event.seq = seq;
-        event.prev_hash = st.audit.last().and_then(|e| e.hash.clone());
-        event.hash = Some(Self::compute_hash(&event));
-        // append-before-return
+        let event =
+            AuditAppendPlan::for_tail(event, prev_hash.clone()).materialize(seq, prev_hash)?;
+        // append-before-return: persisted in memory state before returning Ok.
+        st.next_seq = seq.saturating_add(1);
         st.audit.push(event.clone());
         Ok(event)
     }
@@ -932,6 +970,33 @@ impl Store for InMemoryStore {
             out.truncate(lim as usize);
         }
         Ok(out)
+    }
+
+    async fn get_tool_pin(
+        &self,
+        upstream_id: &str,
+        tool_name: &str,
+    ) -> StoreResult<Option<ToolPinRecord>> {
+        let st = self.lock()?;
+        let key = format!("{}\0{}", upstream_id, tool_name);
+        Ok(st.tool_pins.get(&key).cloned())
+    }
+
+    async fn upsert_tool_pin(&self, record: ToolPinRecord) -> StoreResult<ToolPinRecord> {
+        if record.upstream_id.trim().is_empty() || record.tool_name.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "tool pin upstream_id/tool_name required".into(),
+            ));
+        }
+        if record.descriptor_hash.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "tool pin descriptor_hash required".into(),
+            ));
+        }
+        let mut st = self.lock()?;
+        let key = format!("{}\0{}", record.upstream_id, record.tool_name);
+        st.tool_pins.insert(key, record.clone());
+        Ok(record)
     }
 
     async fn health_check(&self) -> StoreResult<()> {
@@ -1617,5 +1682,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn tool_pin_upsert_and_get_roundtrip() {
+        let store = InMemoryStore::default();
+        let rec = ToolPinRecord {
+            upstream_id: "up1".into(),
+            tool_name: "tool.a".into(),
+            descriptor_hash: "hash1".into(),
+            descriptor_json: r#"{"name":"tool.a"}"#.into(),
+            first_seen_at: "100".into(),
+            approved: true,
+        };
+        store.upsert_tool_pin(rec.clone()).await.unwrap();
+        let got = store.get_tool_pin("up1", "tool.a").await.unwrap().unwrap();
+        assert_eq!(got, rec);
+
+        // drift/update path: upsert replaces (gateway decides policy; store stores record)
+        let drifted = ToolPinRecord {
+            descriptor_hash: "hash2".into(),
+            approved: false,
+            ..rec.clone()
+        };
+        store.upsert_tool_pin(drifted.clone()).await.unwrap();
+        let got = store.get_tool_pin("up1", "tool.a").await.unwrap().unwrap();
+        assert_eq!(got.descriptor_hash, "hash2");
+        assert!(!got.approved);
+
+        assert!(store
+            .get_tool_pin("up1", "missing")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_pin_upsert_rejects_invalid_record() {
+        let store = InMemoryStore::default();
+        let err = store
+            .upsert_tool_pin(ToolPinRecord {
+                upstream_id: "".into(),
+                tool_name: "t".into(),
+                descriptor_hash: "h".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+        let err = store
+            .upsert_tool_pin(ToolPinRecord {
+                upstream_id: "u".into(),
+                tool_name: "t".into(),
+                descriptor_hash: "".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
     }
 }

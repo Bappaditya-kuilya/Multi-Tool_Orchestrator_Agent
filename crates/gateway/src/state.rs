@@ -1420,6 +1420,19 @@ sys.stdin.readline()
         ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
             Ok(vec![])
         }
+        async fn get_tool_pin(
+            &self,
+            _upstream_id: &str,
+            _tool_name: &str,
+        ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+            Ok(None)
+        }
+        async fn upsert_tool_pin(
+            &self,
+            record: store::ToolPinRecord,
+        ) -> store::StoreResult<store::ToolPinRecord> {
+            Ok(record)
+        }
         async fn health_check(&self) -> store::StoreResult<()> {
             Ok(())
         }
@@ -1559,6 +1572,19 @@ sys.stdin.readline()
                 _query: store::TaintSnapshotQuery,
             ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
                 Ok(vec![])
+            }
+            async fn get_tool_pin(
+                &self,
+                _upstream_id: &str,
+                _tool_name: &str,
+            ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+                Ok(None)
+            }
+            async fn upsert_tool_pin(
+                &self,
+                record: store::ToolPinRecord,
+            ) -> store::StoreResult<store::ToolPinRecord> {
+                Ok(record)
             }
             async fn health_check(&self) -> store::StoreResult<()> {
                 Ok(())

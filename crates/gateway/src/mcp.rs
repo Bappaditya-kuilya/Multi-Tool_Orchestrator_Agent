@@ -11,7 +11,10 @@ use scopegate_core::taint::{OperationTarget, SessionTaint, TaintDecision, TaintL
 use scopegate_core::token::{Budget, Expiry, RevocationId, Scope, TaskToken};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use store::{ApprovalRecord, ApprovalStatus as StoreApprovalStatus, AuditEvent, TaskRecord};
+use store::{
+    ApprovalRecord, ApprovalStatus as StoreApprovalStatus, AuditEvent, TaintSnapshotQuery,
+    TaintSnapshotRecord, TaskRecord, ToolPinRecord,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
@@ -57,13 +60,125 @@ fn emit(state: &AppState, kind: &str, message: &str, task_id: Option<String>) {
     });
 }
 
+fn scrub_secret_value_at(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b.is_ascii_whitespace()
+            || matches!(b, b'"' | b'\'' | b',' | b'}' | b']' | b')' | b';' | b'&')
+        {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn redact_secret_markers(text: &str) -> (String, bool) {
+    let mut out = text.to_string();
+    let mut changed = false;
+
+    // Redact key=value secret assignments.
+    for marker in ["api_key=", "password=", "secret=", "token="] {
+        let mut search_from = 0;
+        while let Some(rel) = out[search_from..].to_lowercase().find(marker) {
+            let idx = search_from + rel;
+            let val_start = idx + marker.len();
+            let val_end = scrub_secret_value_at(&out, val_start);
+            if val_end > val_start {
+                out.replace_range(idx..val_end, "[REDACTED]");
+                changed = true;
+                search_from = idx + "[REDACTED]".len();
+            } else {
+                search_from = val_start;
+            }
+        }
+    }
+
+    // Redact common secret prefixes/tokens.
+    for marker in ["sk-", "AKIA", "-----BEGIN"] {
+        let mut search_from = 0;
+        while let Some(rel) = out[search_from..].find(marker) {
+            let idx = search_from + rel;
+            if marker == "-----BEGIN" {
+                if let Some(end_rel) = out[idx..].find("-----END") {
+                    let after_end = idx + end_rel;
+                    if let Some(line_end_rel) = out[after_end..].find("-----") {
+                        let end = after_end + line_end_rel + 5;
+                        out.replace_range(idx..end, "[REDACTED]");
+                        changed = true;
+                        search_from = idx + "[REDACTED]".len();
+                        continue;
+                    }
+                }
+                out.replace_range(idx..out.len(), "[REDACTED]");
+                changed = true;
+                break;
+            } else {
+                let end = scrub_secret_value_at(&out, idx);
+                if end > idx + marker.len() {
+                    out.replace_range(idx..end, "[REDACTED]");
+                    changed = true;
+                    search_from = idx + "[REDACTED]".len();
+                } else {
+                    search_from = idx + marker.len();
+                }
+            }
+        }
+    }
+    (out, changed)
+}
+
+fn scrub_agent_visible_payload(payload: &str) -> Result<String, String> {
+    let (redacted, changed) = redact_secret_markers(payload);
+    // Fail closed if redaction produced empty/invalid JSON boundary for structured payloads we own?
+    // We only redact string content; keep payload. Marker scan is best-effort but enforced.
+    let markers = ["sk-", "AKIA", "-----BEGIN", "password=", "api_key="];
+    let lower = redacted.to_lowercase();
+    if markers.iter().any(|m| lower.contains(&m.to_lowercase())) {
+        // Secret-handling path could not be safely applied.
+        return Err("secret_redaction_incomplete".into());
+    }
+    if changed {
+        // Ensure redacted payload remains valid JSON when original was JSON object/array; if not, fail closed.
+        let trimmed = redacted.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            serde_json::from_str::<Value>(&redacted)
+                .map_err(|_| "secret_redaction_invalid_payload".to_string())?;
+        }
+    }
+    Ok(redacted)
+}
+
+fn finalize_mcp_response(mut resp: McpResponse) -> McpResponse {
+    match scrub_agent_visible_payload(&resp.payload_json) {
+        Ok(scrubbed) => {
+            resp.payload_json = scrubbed;
+            resp
+        }
+        Err(reason) => McpResponse {
+            ok: false,
+            payload_json: json!({
+                "jsonrpc":"2.0",
+                "id": Value::Null,
+                "error":{"code": -32003, "message":"Secret redaction failed (fail-closed)"},
+                "fail_closed": true,
+                "reason": reason
+            })
+            .to_string(),
+            fail_closed: true,
+        },
+    }
+}
+
 fn jsonrpc_error(id: Value, code: i64, message: &str) -> McpResponse {
-    McpResponse {
+    finalize_mcp_response(McpResponse {
         ok: false,
         payload_json: json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message},"fail_closed":true})
             .to_string(),
         fail_closed: true,
-    }
+    })
 }
 
 fn parse_raw(req: &McpRequest) -> Result<Value, McpResponse> {
@@ -398,6 +513,205 @@ fn taint_from_params(params: &Value) -> SessionTaint {
     taint
 }
 
+fn taint_session_key(
+    task_id: Option<&str>,
+    token: Option<&TaskToken>,
+    principal: &str,
+) -> (Option<String>, String) {
+    if let Some(tid) = task_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return (Some(tid.to_string()), format!("mcp.taint.task:{tid}"));
+    }
+    if let Some(tok) = token {
+        let rev = tok.revocation_id.0.trim();
+        if !rev.is_empty() {
+            return (None, format!("mcp.taint.token:{rev}"));
+        }
+    }
+    let p = principal.trim();
+    let p = if p.is_empty() { "anonymous" } else { p };
+    (None, format!("mcp.taint.principal:{p}"))
+}
+
+async fn load_persisted_taint(
+    state: &AppState,
+    task_id: Option<&str>,
+    source: &str,
+) -> Result<SessionTaint, String> {
+    let Some(store) = state.store.as_ref() else {
+        return Err("taint_store_unavailable".into());
+    };
+    let query = if let Some(tid) = task_id {
+        TaintSnapshotQuery {
+            task_id: Some(tid.to_string()),
+            ..Default::default()
+        }
+    } else {
+        TaintSnapshotQuery {
+            source: Some(source.to_string()),
+            ..Default::default()
+        }
+    };
+    let snapshots = store
+        .list_taint_snapshots(query)
+        .await
+        .map_err(|e| format!("taint_store_read_failed:{e}"))?;
+    let mut taint = SessionTaint::new();
+    for snap in snapshots {
+        for label in snap.labels {
+            if let Some(lbl) = parse_taint_label(&label) {
+                taint.add_label(lbl);
+            }
+        }
+    }
+    Ok(taint)
+}
+
+async fn persist_taint_snapshot(
+    state: &AppState,
+    taint: &SessionTaint,
+    task_id: Option<&str>,
+    source: &str,
+) -> Result<(), String> {
+    let Some(store) = state.store.as_ref() else {
+        return Err("taint_store_unavailable".into());
+    };
+    let mut labels = taint.label_names();
+    labels.sort_unstable();
+    labels.dedup();
+    let labels: Vec<String> = labels.into_iter().map(|s| s.to_string()).collect();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let created_at = ts.as_secs().to_string();
+    let id = digest(&format!(
+        "taint|{}|{}|{}|{}",
+        source,
+        task_id.unwrap_or(""),
+        labels.join(","),
+        ts.as_nanos()
+    ));
+    let snapshot = TaintSnapshotRecord {
+        id,
+        task_id: task_id.map(|s| s.to_string()),
+        source: source.to_string(),
+        digest: Some(digest(&labels.join(","))),
+        labels,
+        created_at,
+    };
+    store
+        .record_taint_snapshot(snapshot)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("taint_store_write_failed:{e}"))
+}
+
+fn tool_pin_upstream_id(state: &AppState, req_upstream: Option<&str>) -> String {
+    req_upstream
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            state
+                .config
+                .mcp_default_upstream
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn tool_descriptor_canonical_json(tool: &Value) -> Result<String, String> {
+    let name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "tool_pin_invalid_descriptor:missing_name".to_string())?;
+    let description = tool.get("description").cloned().unwrap_or(Value::Null);
+    let input_schema = tool
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut obj = serde_json::Map::new();
+    obj.insert("description".to_string(), description);
+    obj.insert("inputSchema".to_string(), input_schema);
+    obj.insert("name".to_string(), Value::String(name.to_string()));
+    // serde_json::Map preserves insertion order; keys are inserted in lexicographic order above.
+    serde_json::to_string(&Value::Object(obj))
+        .map_err(|e| format!("tool_pin_descriptor_serialize_failed:{e}"))
+}
+
+fn tool_descriptor_hash(tool: &Value) -> Result<(String, String, String), String> {
+    let name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "tool_pin_invalid_descriptor:missing_name".to_string())?
+        .to_string();
+    let canonical = tool_descriptor_canonical_json(tool)?;
+    let hash = digest(&canonical);
+    Ok((name, canonical, hash))
+}
+
+async fn verify_tool_pins_on_tools_list(
+    state: &AppState,
+    req_upstream: Option<&str>,
+    tools_list_result: &Value,
+) -> Result<(), String> {
+    let Some(store) = state.store.as_ref() else {
+        // No durable store: cannot pin/compare; allow current behavior.
+        return Ok(());
+    };
+    let upstream_id = tool_pin_upstream_id(state, req_upstream);
+    let tools = tools_list_result
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "tool_pin_invalid_tools_list:missing_tools_array".to_string())?;
+
+    for tool in tools {
+        let (tool_name, descriptor_json, descriptor_hash) = tool_descriptor_hash(tool)?;
+        let existing = store
+            .get_tool_pin(&upstream_id, &tool_name)
+            .await
+            .map_err(|e| format!("tool_pin_store_read_failed:{e}"))?;
+        match existing {
+            None => {
+                let first_seen_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string();
+                let rec = ToolPinRecord {
+                    upstream_id: upstream_id.clone(),
+                    tool_name: tool_name.clone(),
+                    descriptor_hash,
+                    descriptor_json,
+                    first_seen_at,
+                    approved: true,
+                };
+                store
+                    .upsert_tool_pin(rec)
+                    .await
+                    .map_err(|e| format!("tool_pin_store_write_failed:{e}"))?;
+            }
+            Some(pin) => {
+                if !pin.approved {
+                    return Err(format!(
+                        "tool_manifest_pin_not_approved: upstream={} tool={} hash={}",
+                        upstream_id, tool_name, pin.descriptor_hash
+                    ));
+                }
+                if pin.descriptor_hash != descriptor_hash {
+                    return Err(format!(
+                        "tool_manifest_drift_detected: upstream={} tool={} pinned_hash={} observed_hash={} (re-approval required)",
+                        upstream_id, tool_name, pin.descriptor_hash, descriptor_hash
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn validate_token_auth(
     state: &AppState,
     token: &TaskToken,
@@ -446,11 +760,23 @@ fn apply_rate_tracker(
     }
 }
 
-fn dispatch_error_to_jsonrpc(e: &str) -> (i64, &'static str) {
+fn dispatch_error_to_jsonrpc(e: &str) -> (i64, String) {
     if e == "method_not_found" {
-        (-32601, "Method not found")
+        (-32601, "Method not found".to_string())
     } else if e == "invalid_params" {
-        (-32602, "Invalid params")
+        (-32602, "Invalid params".to_string())
+    } else if e.starts_with("tool_manifest_drift_detected:")
+        || e.starts_with("tool_manifest_pin_not_approved:")
+    {
+        (
+            -32003,
+            format!("Tool manifest pin violation (fail-closed): {e}"),
+        )
+    } else if e.starts_with("tool_pin_") {
+        (
+            -32002,
+            format!("Tool manifest pin check failed (fail-closed): {e}"),
+        )
     } else if e == "mcp_pool_unavailable"
         || e == "mcp_upstream_unselected"
         || e == "mcp_upstream_not_configured"
@@ -466,12 +792,15 @@ fn dispatch_error_to_jsonrpc(e: &str) -> (i64, &'static str) {
         || e.contains("invalid state for")
         || e.contains("timeout after")
     {
-        (-32002, "MCP upstream unavailable (fail-closed)")
+        (-32002, "MCP upstream unavailable (fail-closed)".to_string())
     } else if e.starts_with("upstream_response_parse_failed") || e.starts_with("upstream_error:") {
-        (-32000, "MCP upstream response invalid (fail-closed)")
+        (
+            -32000,
+            "MCP upstream response invalid (fail-closed)".to_string(),
+        )
     } else {
         // pool_dispatch_failed and other dispatch failures share the same fail-closed response.
-        (-32000, "MCP dispatch failed (fail-closed)")
+        (-32000, "MCP dispatch failed (fail-closed)".to_string())
     }
 }
 
@@ -652,7 +981,7 @@ pub async fn handle_mcp_request_async_with_context(
                 .as_secs()
         });
     let operation = parse_operation_target(params.get("operation").and_then(|v| v.as_str()));
-    let taint = taint_from_params(&params);
+    let mut taint = taint_from_params(&params);
     let (rate_hint, budget_hint, call_count_hint) = parse_hints(&params);
 
     // Apply durable/runtime hooks where configured (best-effort preflight; fail-closed on sync errors).
@@ -774,6 +1103,38 @@ pub async fn handle_mcp_request_async_with_context(
             return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
         }
         return jsonrpc_error(id, -32003, "Missing verifiable token context (fail-closed)");
+    }
+
+    let (taint_task_id, taint_source) =
+        taint_session_key(task_id.as_deref(), provided_token.as_ref(), &principal);
+    if state.store.is_some() {
+        match load_persisted_taint(state, taint_task_id.as_deref(), &taint_source).await {
+            Ok(persisted) => taint.merge(&persisted),
+            Err(e) => {
+                emit(
+                    state,
+                    "mcp.error",
+                    "Taint context unavailable (fail-closed)",
+                    task_id.clone(),
+                );
+                if append_mcp_audit(
+                    state,
+                    task_id.clone(),
+                    &method,
+                    "deny",
+                    Some(e),
+                    Some(digest(&parsed.to_string())),
+                    None,
+                )
+                .await
+                .is_err()
+                    && state.config.fail_closed
+                {
+                    return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
+                }
+                return jsonrpc_error(id, -32002, "Taint context unavailable (fail-closed)");
+            }
+        }
     }
 
     // Taint/rate hooks (pre-dispatch fail-closed checks).
@@ -1291,8 +1652,55 @@ pub async fn handle_mcp_request_async_with_context(
         }
     };
 
+    let mut result = result;
+    if method == "tools/list" {
+        if let Ok(r) = &result {
+            if let Err(e) = verify_tool_pins_on_tools_list(state, req.upstream.as_deref(), r).await
+            {
+                emit(state, "mcp.denied", &e, task_id.clone());
+                result = Err(e);
+            }
+        }
+    }
+
     match result {
         Ok(r) => {
+            if method == "tools/call" {
+                taint.add_label(TaintLabel::UntrustedContent);
+                if state.store.is_some() {
+                    if let Err(e) = persist_taint_snapshot(
+                        state,
+                        &taint,
+                        taint_task_id.as_deref(),
+                        &taint_source,
+                    )
+                    .await
+                    {
+                        emit(
+                            state,
+                            "mcp.error",
+                            "Taint persistence failed (fail-closed)",
+                            task_id.clone(),
+                        );
+                        if append_mcp_audit(
+                            state,
+                            task_id.clone(),
+                            &method,
+                            "deny",
+                            Some(e),
+                            Some(digest(&parsed.to_string())),
+                            Some(digest(&r.to_string())),
+                        )
+                        .await
+                        .is_err()
+                            && state.config.fail_closed
+                        {
+                            return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
+                        }
+                        return jsonrpc_error(id, -32002, "Taint persistence failed (fail-closed)");
+                    }
+                }
+            }
             let audit_res = append_mcp_audit(
                 state,
                 task_id.clone(),
@@ -1313,15 +1721,15 @@ pub async fn handle_mcp_request_async_with_context(
                 return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
             }
             emit(state, "mcp.response", "ok", task_id);
-            McpResponse {
+            finalize_mcp_response(McpResponse {
                 ok: true,
                 payload_json: json!({"jsonrpc":"2.0","id":id,"result":r}).to_string(),
                 fail_closed: false,
-            }
+            })
         }
         Err(e) => {
             let (code, msg) = dispatch_error_to_jsonrpc(&e);
-            emit(state, "mcp.error", msg, task_id.clone());
+            emit(state, "mcp.error", &msg, task_id.clone());
             if append_mcp_audit(
                 state,
                 task_id.clone(),
@@ -1343,7 +1751,7 @@ pub async fn handle_mcp_request_async_with_context(
                 );
                 return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
             }
-            jsonrpc_error(id, code, msg)
+            jsonrpc_error(id, code, &msg)
         }
     }
 }
@@ -1387,22 +1795,22 @@ pub fn handle_mcp_request(
         _ => None,
     };
     match result {
-        Some(r) => McpResponse {
+        Some(r) => finalize_mcp_response(McpResponse {
             ok: true,
             payload_json: json!({"jsonrpc":"2.0","id":id,"result":r}).to_string(),
             fail_closed: false,
-        },
+        }),
         None => jsonrpc_error(id, -32601, "method/tool not found (fail-closed)"),
     }
 }
 
 /// Legacy placeholder.
 pub fn handle_mcp_placeholder(_req: McpRequest) -> McpResponse {
-    McpResponse {
+    finalize_mcp_response(McpResponse {
         ok: false,
         payload_json: json!({"error":"mcp_not_configured","fail_closed":true}).to_string(),
         fail_closed: true,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2104,6 +2512,19 @@ mod tests {
         ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
             Ok(vec![])
         }
+        async fn get_tool_pin(
+            &self,
+            _upstream_id: &str,
+            _tool_name: &str,
+        ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+            Ok(None)
+        }
+        async fn upsert_tool_pin(
+            &self,
+            record: store::ToolPinRecord,
+        ) -> store::StoreResult<store::ToolPinRecord> {
+            Ok(record)
+        }
         async fn health_check(&self) -> store::StoreResult<()> {
             Ok(())
         }
@@ -2277,5 +2698,582 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Token/auth validation failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_success_persists_untrusted_taint_and_blocks_external_egress() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+
+        let first = McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":100,"method":"tools/call",
+                "params":{"name":"gateway.health"}
+            })
+            .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, first).await;
+        assert!(resp.ok, "{}", resp.payload_json);
+        assert!(!resp.fail_closed, "{}", resp.payload_json);
+
+        let second = McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":101,"method":"tools/call",
+                "params":{
+                    "name":"gateway.health",
+                    "operation":"external_egress",
+                    "taint_labels":["private_data"]
+                }
+            })
+            .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, second).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32003);
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("taint") || msg.contains("Approval required"),
+            "{}",
+            resp.payload_json
+        );
+    }
+
+    #[tokio::test]
+    async fn taint_store_read_failure_is_fail_closed() {
+        #[derive(Debug)]
+        struct FailingTaintReadStore;
+        #[async_trait::async_trait]
+        impl store::Store for FailingTaintReadStore {
+            fn backend(&self) -> store::BackendKind {
+                store::BackendKind::InMemory
+            }
+            async fn append_audit_event(
+                &self,
+                event: store::AuditEvent,
+            ) -> store::StoreResult<store::AuditEvent> {
+                Ok(event)
+            }
+            async fn query_audit(
+                &self,
+                _query: store::AuditQuery,
+            ) -> store::StoreResult<Vec<store::AuditEvent>> {
+                Ok(vec![])
+            }
+            async fn verify_audit_chain(
+                &self,
+            ) -> store::StoreResult<store::AuditVerificationReport> {
+                Ok(store::AuditVerificationReport {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            async fn create_approval(
+                &self,
+                approval: ApprovalRecord,
+            ) -> store::StoreResult<ApprovalRecord> {
+                Ok(approval)
+            }
+            async fn get_approval(&self, _id: &str) -> store::StoreResult<Option<ApprovalRecord>> {
+                Ok(None)
+            }
+            async fn list_approvals(
+                &self,
+                _query: store::ApprovalQuery,
+            ) -> store::StoreResult<Vec<ApprovalRecord>> {
+                Ok(vec![])
+            }
+            async fn resolve_approval(
+                &self,
+                _id: &str,
+                _status: ApprovalStatus,
+                _resolver: Option<String>,
+                _resolved_at: String,
+            ) -> store::StoreResult<ApprovalRecord> {
+                Err(store::StoreError::NotFound("x".into()))
+            }
+            async fn upsert_task(&self, task: TaskRecord) -> store::StoreResult<TaskRecord> {
+                Ok(task)
+            }
+            async fn get_task(&self, _id: &str) -> store::StoreResult<Option<TaskRecord>> {
+                Ok(None)
+            }
+            async fn list_tasks(
+                &self,
+                _query: store::TaskQuery,
+            ) -> store::StoreResult<Vec<TaskRecord>> {
+                Ok(vec![])
+            }
+            async fn upsert_policy(
+                &self,
+                policy: store::PolicyRecord,
+            ) -> store::StoreResult<store::PolicyRecord> {
+                Ok(policy)
+            }
+            async fn get_active_policy(&self) -> store::StoreResult<Option<store::PolicyRecord>> {
+                Ok(None)
+            }
+            async fn record_revocation(
+                &self,
+                record: store::RevocationRecord,
+            ) -> store::StoreResult<store::RevocationRecord> {
+                Ok(record)
+            }
+            async fn list_revocations(
+                &self,
+                _query: store::RevocationQuery,
+            ) -> store::StoreResult<Vec<store::RevocationRecord>> {
+                Ok(vec![])
+            }
+            async fn record_taint_snapshot(
+                &self,
+                snapshot: store::TaintSnapshotRecord,
+            ) -> store::StoreResult<store::TaintSnapshotRecord> {
+                Ok(snapshot)
+            }
+            async fn list_taint_snapshots(
+                &self,
+                _query: store::TaintSnapshotQuery,
+            ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
+                Err(store::StoreError::Unavailable("taint read boom".into()))
+            }
+            async fn get_tool_pin(
+                &self,
+                _upstream_id: &str,
+                _tool_name: &str,
+            ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+                Ok(None)
+            }
+            async fn upsert_tool_pin(
+                &self,
+                record: store::ToolPinRecord,
+            ) -> store::StoreResult<store::ToolPinRecord> {
+                Ok(record)
+            }
+            async fn health_check(&self) -> store::StoreResult<()> {
+                Ok(())
+            }
+        }
+
+        let store: Arc<dyn store::Store> = Arc::new(FailingTaintReadStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"gateway.health"}}).to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32002);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Taint context unavailable"));
+    }
+
+    #[test]
+    fn scrub_agent_visible_payload_redacts_secret_markers() {
+        let payload = json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"content":[{"type":"text","text":"leaked api_key=supersecret token=abc123"}]}
+        })
+        .to_string();
+        let scrubbed = scrub_agent_visible_payload(&payload).expect("should scrub");
+        assert!(!scrubbed.contains("supersecret"), "{scrubbed}");
+        assert!(
+            !scrubbed.to_lowercase().contains("api_key=supersecret"),
+            "{scrubbed}"
+        );
+        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+    }
+
+    #[test]
+    fn jsonrpc_error_scrubs_secret_markers() {
+        let resp = jsonrpc_error(Value::from(7), -32000, "upstream failed: password=hunter2");
+        assert!(resp.fail_closed);
+        assert!(
+            !resp.payload_json.contains("hunter2"),
+            "{}",
+            resp.payload_json
+        );
+        assert!(
+            resp.payload_json.contains("[REDACTED]"),
+            "{}",
+            resp.payload_json
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_first_seen_records_tool_pin_and_allows() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":210,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, req).await;
+        assert!(resp.ok, "{}", resp.payload_json);
+        let store = state.store.as_ref().unwrap();
+        let pin = store
+            .get_tool_pin("default", "gateway.health")
+            .await
+            .unwrap()
+            .expect("first-seen pin should be recorded");
+        assert!(pin.approved);
+        assert!(!pin.descriptor_hash.is_empty());
+        assert!(pin.descriptor_json.contains("gateway.health"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_drift_is_denied_fail_closed() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let store = state.store.as_ref().unwrap();
+        store
+            .upsert_tool_pin(store::ToolPinRecord {
+                upstream_id: "default".into(),
+                tool_name: "gateway.health".into(),
+                descriptor_hash: "pinned-old-hash".into(),
+                descriptor_json:
+                    r#"{"description":"old","inputSchema":{},"name":"gateway.health"}"#.into(),
+                first_seen_at: "1".into(),
+                approved: true,
+            })
+            .await
+            .unwrap();
+
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":211,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32003);
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("tool_manifest_drift_detected"), "{msg}");
+        assert!(msg.contains("re-approval required"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tools_list_unapproved_pin_is_denied_fail_closed() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let store = state.store.as_ref().unwrap();
+        store
+            .upsert_tool_pin(store::ToolPinRecord {
+                upstream_id: "default".into(),
+                tool_name: "gateway.health".into(),
+                descriptor_hash: "any".into(),
+                descriptor_json: "{}".into(),
+                first_seen_at: "1".into(),
+                approved: false,
+            })
+            .await
+            .unwrap();
+
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":212,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("tool_manifest_pin_not_approved"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tools_list_pin_store_read_failure_is_fail_closed() {
+        #[derive(Debug)]
+        struct FailingToolPinReadStore;
+        #[async_trait::async_trait]
+        impl store::Store for FailingToolPinReadStore {
+            fn backend(&self) -> store::BackendKind {
+                store::BackendKind::InMemory
+            }
+            async fn append_audit_event(
+                &self,
+                event: store::AuditEvent,
+            ) -> store::StoreResult<store::AuditEvent> {
+                Ok(event)
+            }
+            async fn query_audit(
+                &self,
+                _query: store::AuditQuery,
+            ) -> store::StoreResult<Vec<store::AuditEvent>> {
+                Ok(vec![])
+            }
+            async fn verify_audit_chain(
+                &self,
+            ) -> store::StoreResult<store::AuditVerificationReport> {
+                Ok(store::AuditVerificationReport {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            async fn create_approval(
+                &self,
+                approval: ApprovalRecord,
+            ) -> store::StoreResult<ApprovalRecord> {
+                Ok(approval)
+            }
+            async fn get_approval(&self, _id: &str) -> store::StoreResult<Option<ApprovalRecord>> {
+                Ok(None)
+            }
+            async fn list_approvals(
+                &self,
+                _query: store::ApprovalQuery,
+            ) -> store::StoreResult<Vec<ApprovalRecord>> {
+                Ok(vec![])
+            }
+            async fn resolve_approval(
+                &self,
+                _id: &str,
+                _status: store::ApprovalStatus,
+                _resolver: Option<String>,
+                _resolved_at: String,
+            ) -> store::StoreResult<ApprovalRecord> {
+                Err(store::StoreError::NotFound("x".into()))
+            }
+            async fn upsert_task(&self, task: TaskRecord) -> store::StoreResult<TaskRecord> {
+                Ok(task)
+            }
+            async fn get_task(&self, _id: &str) -> store::StoreResult<Option<TaskRecord>> {
+                Ok(None)
+            }
+            async fn list_tasks(
+                &self,
+                _query: store::TaskQuery,
+            ) -> store::StoreResult<Vec<TaskRecord>> {
+                Ok(vec![])
+            }
+            async fn upsert_policy(
+                &self,
+                policy: store::PolicyRecord,
+            ) -> store::StoreResult<store::PolicyRecord> {
+                Ok(policy)
+            }
+            async fn get_active_policy(&self) -> store::StoreResult<Option<store::PolicyRecord>> {
+                Ok(None)
+            }
+            async fn record_revocation(
+                &self,
+                record: store::RevocationRecord,
+            ) -> store::StoreResult<store::RevocationRecord> {
+                Ok(record)
+            }
+            async fn list_revocations(
+                &self,
+                _query: store::RevocationQuery,
+            ) -> store::StoreResult<Vec<store::RevocationRecord>> {
+                Ok(vec![])
+            }
+            async fn record_taint_snapshot(
+                &self,
+                snapshot: store::TaintSnapshotRecord,
+            ) -> store::StoreResult<store::TaintSnapshotRecord> {
+                Ok(snapshot)
+            }
+            async fn list_taint_snapshots(
+                &self,
+                _query: store::TaintSnapshotQuery,
+            ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
+                Ok(vec![])
+            }
+            async fn get_tool_pin(
+                &self,
+                _upstream_id: &str,
+                _tool_name: &str,
+            ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+                Err(store::StoreError::Unavailable("pin read boom".into()))
+            }
+            async fn upsert_tool_pin(
+                &self,
+                record: store::ToolPinRecord,
+            ) -> store::StoreResult<store::ToolPinRecord> {
+                Ok(record)
+            }
+            async fn health_check(&self) -> store::StoreResult<()> {
+                Ok(())
+            }
+        }
+
+        let store: Arc<dyn store::Store> = Arc::new(FailingToolPinReadStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":213,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&mut state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("tool_pin_store_read_failed"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn mcp_responses_are_bound_to_request_id_and_task_across_shared_state() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let store = state.store.clone().unwrap();
+        for tid in ["task-a", "task-b"] {
+            store
+                .upsert_task(TaskRecord {
+                    id: tid.into(),
+                    token_id: "tok".into(),
+                    scopes: "[]".into(),
+                    budget: 1,
+                    expires_at: "later".into(),
+                    revoked: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let mk = |id: i64, task_id: &str| McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"gateway.health","task_id":task_id,"principal":"anonymous"}
+            })
+            .to_string(),
+            upstream: None,
+        };
+
+        let resp_a = handle_mcp_request_async(&mut state, mk(101, "task-a")).await;
+        let resp_b = handle_mcp_request_async(&mut state, mk(202, "task-b")).await;
+
+        for (resp, expected_id, expected_task) in
+            [(&resp_a, 101i64, "task-a"), (&resp_b, 202i64, "task-b")]
+        {
+            assert!(resp.ok, "{}", resp.payload_json);
+            let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+            assert_eq!(v["id"], expected_id, "response id must be request-local");
+            assert_eq!(
+                v["result"]["structuredContent"]["ok"], true,
+                "{}",
+                resp.payload_json
+            );
+            assert!(
+                !resp.payload_json.contains(if expected_task == "task-a" {
+                    "\"task-b\""
+                } else {
+                    "\"task-a\""
+                }),
+                "response must not leak other task id: {}",
+                resp.payload_json
+            );
+        }
+
+        let audit = store
+            .query_audit(store::AuditQuery {
+                limit: Some(50),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let allow_a = audit.iter().any(|e| {
+            e.task_id.as_deref() == Some("task-a")
+                && e.tool.as_deref() == Some("tools/call")
+                && e.decision == "allow"
+        });
+        let allow_b = audit.iter().any(|e| {
+            e.task_id.as_deref() == Some("task-b")
+                && e.tool.as_deref() == Some("tools/call")
+                && e.decision == "allow"
+        });
+        assert!(allow_a, "task-a audit missing: {audit:?}");
+        assert!(allow_b, "task-b audit missing: {audit:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_task_and_approval_context_are_request_local() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let store = state.store.clone().unwrap();
+        for (tid, aid) in [("task-a", "ap-a"), ("task-b", "ap-b")] {
+            store
+                .upsert_task(TaskRecord {
+                    id: tid.into(),
+                    token_id: "tok".into(),
+                    scopes: "[]".into(),
+                    budget: 1,
+                    expires_at: "later".into(),
+                    revoked: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .create_approval(ApprovalRecord {
+                    id: aid.into(),
+                    task_id: tid.into(),
+                    tool: "gateway.health".into(),
+                    args_hash: "h".into(),
+                    status: ApprovalStatus::Approved,
+                    created_at: "now".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        // Request A uses task-a/ap-a (valid). Request B tries to reuse ap-a on task-b (mismatch).
+        let req_a = McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":"req-a","method":"tools/call",
+                "params":{"name":"gateway.health","task_id":"task-a","approval_id":"ap-a","principal":"anonymous"}
+            })
+            .to_string(),
+            upstream: None,
+        };
+        let req_b = McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":"req-b","method":"tools/call",
+                "params":{"name":"gateway.health","task_id":"task-b","approval_id":"ap-a","principal":"anonymous"}
+            })
+            .to_string(),
+            upstream: None,
+        };
+
+        let resp_a = handle_mcp_request_async(&mut state, req_a).await;
+        let resp_b = handle_mcp_request_async(&mut state, req_b).await;
+
+        let va: Value = serde_json::from_str(&resp_a.payload_json).unwrap();
+        assert!(resp_a.ok, "{}", resp_a.payload_json);
+        assert_eq!(va["id"], "req-a");
+        assert_eq!(va["result"]["structuredContent"]["ok"], true);
+
+        let vb: Value = serde_json::from_str(&resp_b.payload_json).unwrap();
+        assert!(resp_b.fail_closed, "{}", resp_b.payload_json);
+        assert_eq!(vb["id"], "req-b", "denied response must keep request id");
+        assert!(vb["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Approval task mismatch"));
+        assert!(
+            !resp_b.payload_json.contains("task-a"),
+            "cross-task context leaked into response: {}",
+            resp_b.payload_json
+        );
     }
 }

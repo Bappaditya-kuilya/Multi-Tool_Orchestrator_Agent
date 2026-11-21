@@ -473,6 +473,14 @@ pub async fn handle_v1_tasks(
         Err(e) => return ApiResponse::bad_request(e),
     };
 
+    // Sync durable runtime state (revocations/approvals/rate hooks) before lifecycle evaluation.
+    // Fail closed when required hook state cannot be loaded/verified.
+    if let Err(e) = state.prepare_runtime_hooks().await {
+        return ApiResponse::unavailable(format!(
+            "runtime hook preparation failed (fail-closed): {e}"
+        ));
+    }
+
     // Idempotency/conflict: task creation is not replay-safe because lifecycle evaluation
     // and audit append are side-effecting. Fail closed on duplicate IDs.
     match store.get_task(&inbound.task_id).await {
@@ -2041,6 +2049,70 @@ mod tests {
             .await;
             assert_eq!(filtered.status, HttpStatus::Ok);
             assert_eq!(filtered.body.unwrap().approvals.len(), 1);
+        });
+    }
+
+    #[test]
+    fn task_create_syncs_durable_revocations_fail_closed_before_lifecycle() {
+        rt().block_on(async {
+            let store = Arc::new(InMemoryStore::default()) as Arc<dyn store::Store>;
+            store
+                .record_revocation(store::RevocationRecord {
+                    id: "rev-1".into(),
+                    target_kind: "token".into(),
+                    target_id: "r1".into(),
+                    reason: Some("compromised".into()),
+                    revoked_at: "1".into(),
+                    revoked_by: Some("admin".into()),
+                })
+                .await
+                .unwrap();
+
+            let mut st = AppState::fail_closed().with_store(store);
+            st.config = st.config.clone().with_rules(vec![Rule::exact(
+                "agent",
+                "tool.invoke",
+                "tool",
+                PolicyDecision::Permit,
+            )]);
+            st.config.runtime_hooks.sync_revocations_from_store = true;
+
+            // No manual sync: API path must prepare runtime hooks and deny with restored revocation.
+            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            assert_eq!(resp.status, HttpStatus::Forbidden);
+            assert!(resp.fail_closed);
+            let body = resp.body.unwrap();
+            assert_eq!(body.state, "denied");
+            assert!(body
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("InvalidToken"));
+            assert!(st.config.revoked_token_ids.iter().any(|id| id == "r1"));
+        });
+    }
+
+    #[test]
+    fn task_create_fails_closed_when_required_revocation_sync_store_missing() {
+        rt().block_on(async {
+            let mut st = AppState::fail_closed();
+            st.config = st.config.clone().with_rules(vec![Rule::exact(
+                "agent",
+                "tool.invoke",
+                "tool",
+                PolicyDecision::Permit,
+            )]);
+            st.config.runtime_hooks.sync_revocations_from_store = true;
+
+            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            assert_eq!(resp.status, HttpStatus::ServiceUnavailable);
+            assert!(resp.fail_closed);
+            let err = resp.error.unwrap_or_default();
+            assert!(
+                err.contains("store unavailable")
+                    || err.contains("runtime hook preparation failed"),
+                "unexpected error: {err}"
+            );
         });
     }
 }

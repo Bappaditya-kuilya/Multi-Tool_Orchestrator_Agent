@@ -6,7 +6,7 @@ use crate::{
     apply_migrations, verify_audit_chain_events, ApprovalQuery, ApprovalRecord, ApprovalStatus,
     AuditEvent, AuditQuery, AuditVerificationReport, BackendKind, PolicyRecord, RevocationQuery,
     RevocationRecord, Store, StoreConfig, StoreError, StoreResult, TaintSnapshotQuery,
-    TaintSnapshotRecord, TaskQuery, TaskRecord,
+    TaintSnapshotRecord, TaskQuery, TaskRecord, ToolPinRecord,
 };
 
 #[cfg(feature = "sqlite-sqlx")]
@@ -1078,6 +1078,96 @@ impl Store for SqliteStore {
         }
     }
 
+    async fn get_tool_pin(
+        &self,
+        upstream_id: &str,
+        tool_name: &str,
+    ) -> StoreResult<Option<ToolPinRecord>> {
+        #[cfg(feature = "sqlite-sqlx")]
+        {
+            let pool = self.pool()?;
+            let row = sqlx::query(
+                "SELECT upstream_id, tool_name, descriptor_hash, descriptor_json, first_seen_at, approved \
+                 FROM tool_pins WHERE upstream_id = ?1 AND tool_name = ?2",
+            )
+            .bind(upstream_id)
+            .bind(tool_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| map_durable_error("sqlite get tool pin", e))?;
+            if let Some(r) = row {
+                let approved_i: i64 = r
+                    .try_get("approved")
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                return Ok(Some(ToolPinRecord {
+                    upstream_id: r
+                        .try_get("upstream_id")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    tool_name: r
+                        .try_get("tool_name")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    descriptor_hash: r
+                        .try_get("descriptor_hash")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    descriptor_json: r
+                        .try_get("descriptor_json")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    first_seen_at: r
+                        .try_get("first_seen_at")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    approved: approved_i != 0,
+                }));
+            }
+            return Ok(None);
+        }
+        #[cfg(not(feature = "sqlite-sqlx"))]
+        {
+            let _ = (upstream_id, tool_name);
+            Err(self.durable_unavailable("sqlite get_tool_pin"))
+        }
+    }
+
+    async fn upsert_tool_pin(&self, record: ToolPinRecord) -> StoreResult<ToolPinRecord> {
+        #[cfg(feature = "sqlite-sqlx")]
+        {
+            if record.upstream_id.trim().is_empty() || record.tool_name.trim().is_empty() {
+                return Err(StoreError::Invalid(
+                    "tool pin upstream_id/tool_name required".into(),
+                ));
+            }
+            if record.descriptor_hash.trim().is_empty() {
+                return Err(StoreError::Invalid(
+                    "tool pin descriptor_hash required".into(),
+                ));
+            }
+            let pool = self.pool()?;
+            sqlx::query(
+                "INSERT INTO tool_pins (upstream_id, tool_name, descriptor_hash, descriptor_json, first_seen_at, approved) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(upstream_id, tool_name) DO UPDATE SET \
+                   descriptor_hash=excluded.descriptor_hash, \
+                   descriptor_json=excluded.descriptor_json, \
+                   first_seen_at=excluded.first_seen_at, \
+                   approved=excluded.approved",
+            )
+            .bind(&record.upstream_id)
+            .bind(&record.tool_name)
+            .bind(&record.descriptor_hash)
+            .bind(&record.descriptor_json)
+            .bind(&record.first_seen_at)
+            .bind(if record.approved { 1_i64 } else { 0_i64 })
+            .execute(pool)
+            .await
+            .map_err(|e| map_durable_error("sqlite upsert tool pin", e))?;
+            return Ok(record);
+        }
+        #[cfg(not(feature = "sqlite-sqlx"))]
+        {
+            let _ = record;
+            Err(self.durable_unavailable("sqlite upsert_tool_pin"))
+        }
+    }
+
     async fn health_check(&self) -> StoreResult<()> {
         #[cfg(feature = "sqlite-sqlx")]
         {
@@ -1463,7 +1553,7 @@ mod tests {
         .unwrap();
         store.connect().await.unwrap();
         let first_mig = store.migrate().await.unwrap();
-        assert_eq!(first_mig, vec![1]);
+        assert_eq!(first_mig, vec![1, 2]);
 
         store
             .upsert_policy(PolicyRecord {
@@ -1704,6 +1794,108 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-shm"));
         let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_restart_seq_gap_tamper_fail_closed() {
+        let path = format!(
+            "/tmp/opencode/store-seqgap-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        store.connect().await.unwrap();
+        store.migrate().await.unwrap();
+        for ts in ["t1", "t2", "t3"] {
+            store
+                .append_audit_event(AuditEvent {
+                    ts: ts.into(),
+                    decision: "allow".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        // Tamper by deleting middle row -> seq gap / chain break on restart.
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("DELETE FROM audit_events WHERE seq = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(pool);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let err = reopened.verify_audit_chain().await.unwrap_err();
+        assert!(matches!(err, StoreError::Integrity(_)));
+
+        let mut reopened_report = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url,
+            fail_closed_on_audit_error: false,
+        })
+        .unwrap();
+        reopened_report.connect().await.unwrap();
+        let rep = reopened_report.verify_audit_chain().await.unwrap();
+        assert!(!rep.ok);
+        assert_eq!(rep.message.as_deref(), Some("seq mismatch"));
+        assert_eq!(rep.first_bad_seq, Some(3));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_append_write_failure_fail_closed() {
+        let store = setup("append_write_fail_closed").await;
+        store
+            .append_audit_event(AuditEvent {
+                ts: "t1".into(),
+                decision: "allow".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Simulate durable write failure: append must fail closed (no Ok return).
+        let pool = store.pool().unwrap();
+        sqlx::query("DROP TABLE audit_events")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let err = store
+            .append_audit_event(AuditEvent {
+                ts: "t2".into(),
+                decision: "deny".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Unavailable(_) | StoreError::Conflict(_) | StoreError::Invalid(_)
+        ));
     }
 
     #[cfg(feature = "sqlite-sqlx")]

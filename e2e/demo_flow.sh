@@ -90,6 +90,7 @@ API_BASE_URL="${API_BASE_URL%/}"
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 step_fail=0
 failures=()
+soft_failures=()
 api_flow_bench_ran=0
 api_flow_status="not_run"
 restart_persistence_status="not_run"
@@ -112,6 +113,22 @@ run_step() {
       exit "$code"
     fi
     return "$code"
+  fi
+}
+
+run_soft_step() {
+  local name="$1"; shift
+  local log="$1"; shift
+  echo "[demo_flow] $(timestamp) STEP(soft): $name" | tee "$log"
+  local code=0
+  "$@" > >(tee -a "$log") 2>&1 || code=$?
+  if [[ "$code" -eq 0 ]]; then
+    echo "[demo_flow] RESULT: $name OK" | tee -a "$log"
+    return 0
+  else
+    echo "[demo_flow] RESULT: $name SOFT-FAILED ($code) (non-blocking)" | tee -a "$log"
+    soft_failures+=("$name:$code")
+    return 0
   fi
 }
 
@@ -1001,9 +1018,9 @@ run_step "build_gateway" "$LOG_DIR/build_gateway.log" run_build_gateway_step || 
 echo "[demo_flow] Step 1b: Probe gateway CLI/binary (best-effort, non-blocking)"
 if command -v timeout >/dev/null 2>&1; then
   if [[ -x "$ROOT/target/debug/gateway" ]]; then
-    run_step "gateway_help_probe" "$LOG_DIR/gateway_help_probe.log" timeout 5s env SCOPEGATE_CONFIG="${SCOPEGATE_CONFIG:-$ROOT/scopegate.toml.example}" "$ROOT/target/debug/gateway" --help || true
+    run_soft_step "gateway_help_probe" "$LOG_DIR/gateway_help_probe.log" timeout 5s env SCOPEGATE_CONFIG="${SCOPEGATE_CONFIG:-$ROOT/scopegate.toml.example}" "$ROOT/target/debug/gateway" --help
   elif command -v cargo >/dev/null 2>&1; then
-    run_step "gateway_help_probe" "$LOG_DIR/gateway_help_probe.log" timeout 20s env SCOPEGATE_CONFIG="${SCOPEGATE_CONFIG:-$ROOT/scopegate.toml.example}" cargo run -q -p gateway -- --help || true
+    run_soft_step "gateway_help_probe" "$LOG_DIR/gateway_help_probe.log" timeout 20s env SCOPEGATE_CONFIG="${SCOPEGATE_CONFIG:-$ROOT/scopegate.toml.example}" cargo run -q -p gateway -- --help
   else
     echo "[demo_flow] gateway_help_probe skipped (no timeout-capable probe target)" | tee "$LOG_DIR/gateway_help_probe.log"
   fi

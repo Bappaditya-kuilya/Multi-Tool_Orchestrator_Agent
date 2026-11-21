@@ -15,9 +15,9 @@
 ## Blockers (exact, release-critical)
 
 - **Runtime/security deps not production-complete:** Biscuit verification/attenuation, Cedar engine + YAML compile/load, full `rmcp` runtime/front-pool/upstream execution, production secret broker/adapters with injection/redaction guarantees, complete approvals/runtime behavior.
-- **Durability/audit not proven:** end-to-end fail-closed store lifecycle, durable append-before-return audit, persisted/restart verification, cryptographic hashing/signing/anchoring, restart-safe approvals/task/revocation/budgets.
+- **Durability/audit not proven:** end-to-end fail-closed store lifecycle across all runtime paths, durable append-before-return/cryptographic audit guarantees, persisted/restart verification across all scenarios, and restart-safe rate/budget counters (no store snapshot API); approvals/revocation/task restart wiring improved but not fully sign-off-proven.
 - **M6 hardening incomplete:** production tracing/OTel, stable observability schemas, enforced rate-limit/budget/taint propagation/egress hooks with auditable outcomes.
-- **Evidence gaps:** dashboard/SDK/live E2E integration against wired enforcement paths unverified; bench xfails/capability gaps unresolved for sign-off; no enforce-mode/live benchmark bundle suitable for release.
+- **Evidence gaps:** dashboard/SDK/live E2E integration against wired enforcement paths unverified; bench still **38p/7x** — 3 handler/store-enforced capabilities have Rust tests but live stdio+sqlite bench E2E not wired, 1 cross-task isolation lacks concurrent proof (global mutex serialization only), 3 env-gated live-gateway integration cases; no enforce-mode/live benchmark bundle suitable for release. Also rate/budget counters not restart-restorable (no store snapshot API).
 - **Ops/release gaps:** no complete S1 validation bundle, no S2 validation/drills, no backup/restore/rollback evidence, no hosted demo, no security sign-off, no versioned artifacts/checksums.
 
 ## What remains for production/release readiness

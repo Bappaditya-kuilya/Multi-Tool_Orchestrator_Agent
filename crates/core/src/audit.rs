@@ -3,6 +3,11 @@
 //! Default hashing remains a pure in-memory FNV-1a placeholder (no external
 //! crypto deps) so stronger hash implementations can be injected later.
 //! A SHA-256 hasher is available behind the `sha2` feature for runtime use.
+//!
+//! For durable append-before-return flows, stage an entry, persist it in the
+//! durable store, then append the staged entry only after persistence succeeds.
+//! Verification/staging helpers are fail-closed and return `VerifyError` on
+//! chain/hash mismatches without mutating the in-memory log.
 
 /// A single audit log entry linked to the previous entry by hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
