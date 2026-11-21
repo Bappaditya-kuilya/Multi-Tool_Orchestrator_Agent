@@ -2,7 +2,7 @@
 
 Status: runnable pytest harness for PRD M4 with gateway-independent local models plus gateway-dependent/live integration cases. Provides local enforcement evidence, live-gateway enforcement evidence path (probe/policy/latency checks when endpoint configured), stronger enforce-mode assertions, latency/overhead reporting, and CI artifacts. Collection/execution succeed without a gateway (live cases xfail with explicit reasons when unconfigured).
 
-**Non-live baseline expectation:** `38 passed, 7 xfailed` with explicit gateway-dependent reasons recorded in test output and report artifacts (1 capability-gated case + 6 live-integration/env-gated cases when gateway URL not configured). With a configured gateway, injection/taint-egress, rug-pull stable-pin, and secret-redaction live E2E cases can pass when enforcement evidence is observed.
+**Non-live baseline expectation:** `38 passed, 7 xfailed` with explicit gateway-dependent reasons recorded in test output and report artifacts (7 live-integration/env-gated cases when gateway URL not configured). With a configured gateway, injection/taint-egress, rug-pull stable-pin, secret-redaction, and confused-deputy concurrent MCP isolation live E2E cases can pass when enforcement evidence is observed.
 
 ## Semantics
 - **pass**: modeled attack/edge case blocked or invariant preserved by local model/enforcement checks, or live gateway evidence observed (probe/policy denial/latency) when configured and enforced.
@@ -16,7 +16,7 @@ Collection/execution succeed without a gateway. Live cases xfail cleanly when `-
 |---|---|---|---|
 | Injection exfil | `injection_exfil` | Untrusted tool/text steers agent to exfiltrate private data | live-gated E2E: tools/call seeds UntrustedContent taint; external_egress denied/fail-closed (env-gated xfail when gateway unconfigured) |
 | Scope escalation | `scope_escalation` | Call/token exceeds granted scopes or parent authority | attenuation + no-inflation invariants |
-| Confused deputy | `confused_deputy` | Gateway/tool acts with wrong principal/task authority | correlation invariant; isolation xfail |
+| Confused deputy | `confused_deputy` | Gateway/tool acts with wrong principal/task authority | correlation invariant; live-gated concurrent MCP id-isolation E2E when gateway configured (xfail with reason when unconfigured/unprovable) |
 | Tool poisoning | `tool_poisoning` | Poisoned manifest/metadata/output alters routing or privilege | no manifest-scope inflation; clean unknown-capability failure |
 | Rug pull | `rug_pull` | Trusted tool changes behavior/schema after discovery/approval | live-gated E2E: repeated tools/list stable-pin, no false drift denial; drift-induction needs controllable upstream (env-gated xfail when unconfigured) |
 | Secret leak | `secret_leak` | Upstream secrets exposed to agent, logs, or responses | live-gated E2E: echo-induced secret marker scrubbed/fail-closed; xfail if no echo tool (env-gated xfail when unconfigured) |
@@ -62,7 +62,7 @@ Markers: `baseline`, `dryrun`, `enforce`, `live` (suite default: `baseline`). Fi
 | `test_scope_escalation_child_exceeds_parent` | `reference/tests/test_security_confinement.py::test_child_cannot_run_scope_parent_never_granted` | child request outside parent grant denied/empty attenuation |
 | `test_scope_escalation_no_inflation_from_requested_superset` | confinement + attenuation intent | requested superset cannot inflate granted scopes |
 | `test_confused_deputy_cross_task_or_authority_confusion` | `reference/tests/test_security_queue.py` reply/correlation integrity intent (C/H-3 class) | local correlation invariant; gateway isolation xfail in companion case |
-| `test_confused_deputy_gateway_isolation_enforcement` | `reference/tests/test_security_queue.py::test_forged_reply_on_reply_topic_is_rejected`, `test_concurrent_same_task_id_no_cross_delivery` | requires live queue/gateway isolation -> xfail |
+| `test_confused_deputy_gateway_isolation_enforcement` | `reference/tests/test_security_queue.py::test_forged_reply_on_reply_topic_is_rejected`, `test_concurrent_same_task_id_no_cross_delivery` | live-gated E2E: concurrent /mcp JSON-RPC requests with distinct ids; each response echoes own id and contains no foreign id. Xfail when gateway unconfigured/unreachable/unprovable. Complements Rust `crates/gateway/tests/integration.rs::mcp_concurrent_requests_are_isolated_through_router`. |
 | `test_tool_poisoning_malicious_manifest_or_metadata` | `reference/tests/test_security_tokens.py::test_token_not_inflated_by_poisoned_manifest` | poisoned manifest scope must not inflate issued/granted scope |
 | `test_tool_poisoning_unknown_capability_fails_cleanly` | `reference/tests/test_security_routing.py::test_executor_unknown_capability_returns_failed_result`, `test_parallel_executor_unknown_capability_returns_failed_result` | unknown capability -> typed clean failure/None, no crash |
 | `test_dos_inputs_malformed_or_resource_exhausting_payload` | `reference/tests/test_security_depth.py::test_nested_sub_tasks_beyond_depth_limit_fail_cleanly`, depth/bounds intent (CRASH-08) | budget depth/payload/size guards raise typed `BudgetExceeded` |
@@ -117,7 +117,7 @@ Live gateway helper (`bench/run_local_gateway.sh [mode]`): runs live-marked chec
 
 ## Coverage and porting notes
 - **Local-model (gateway-independent):** scope attenuation/no-inflation/ordering/revocation, benign + unknown-capability routing invariants, payload/depth/sequence-item/mapping-item/pow/expression/task-spec/budget bounds with typed clean failures, hash-chain append/order/tamper/removal/prev-hash/scale integrity checks, secret-redaction and taint-egress/rug-pull-drift models, stronger enforce-mode assertions, latency/overhead measurements and summaries.
-- **Gateway-dependent/live:** confused-deputy isolation remains capability-gated xfail (concurrent isolation not proven). Injection/taint-egress, rug-pull stable-pin, and secret-redaction are live-gated E2E cases that xfail when gateway/required upstream evidence is unavailable and can pass when configured; live health/policy/latency probes also xfail without endpoint. When `SCOPEGATE_GATEWAY_URL` is configured, live cases run and provide endpoint-backed enforcement/latency evidence.
+- **Gateway-dependent/live:** Injection/taint-egress, rug-pull stable-pin, secret-redaction, and confused-deputy concurrent MCP isolation are live-gated E2E cases that xfail when gateway/required evidence is unavailable or cannot be proven reliably and can pass when configured; live health/policy/latency probes also xfail without endpoint. When `SCOPEGATE_GATEWAY_URL` is configured, live cases run and provide endpoint-backed enforcement/latency evidence (no fake pass).
 - **Reference alignment:** mapped to `reference/tests/test_attacks.py` and `reference/tests/test_security_{confinement,depth,pow,queue,routing,tokens}.py`, `reference/tests/test_auditor.py` as noted above; new cases extend malformed-shape/list-bound/ordering/benign-routing/enforcement/latency coverage while preserving typed clean-failure contracts.
 
 ## Running

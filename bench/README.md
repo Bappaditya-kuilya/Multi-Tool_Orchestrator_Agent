@@ -8,8 +8,8 @@ Pytest-based attack benchmark harness for ScopeGate (PRD M4 / F10). Maps PRD att
 - **xfail**: gateway-dependent capability not currently enforced/provable, or live integration case when endpoint not configured/reachable; documented reason in test output and captured explicitly in reports/artifacts, does not fail CI by default.
 - **skip**: reserved for environment gating (not used for core coverage).
 - **enforce mode**: stronger assertions require modeled attacks/denials to hold as blocked evidence; live policy checks must observe denial when reachable.
-- **Baseline expectation (no live gateway configured):** `38 passed, 7 xfailed` — 1 gateway-capability case (confused-deputy isolation) + 6 live-integration/env-gated cases xfailed with explicit reasons. With a configured gateway, the 3 wired live E2E cases (injection/taint egress, rug-pull stable-pin, secret redaction) can pass when enforcement evidence is observed.
-- **Live gateway configured (`SCOPEGATE_GATEWAY_URL` reachable):** live integration probe/policy-denial/latency cases can pass when enforced, reducing xfails to capability-gated cases that remain unimplemented (precise reasons retained).
+- **Baseline expectation (no live gateway configured):** `38 passed, 7 xfailed` — 7 live-integration/env-gated cases xfailed with explicit reasons. With a configured gateway, wired live E2E cases (injection/taint egress, rug-pull stable-pin, secret redaction, confused-deputy concurrent MCP isolation) can pass when enforcement evidence is observed.
+- **Live gateway configured (`SCOPEGATE_GATEWAY_URL` reachable):** live integration probe/policy-denial/latency/E2E cases can pass when enforced; cases that cannot be proven on the configured gateway xfail with precise reasons (no fake pass).
 
 ## Layout
 - `test_attack_suite.py` — named cases per PRD class (injection exfil, scope escalation, confused deputy, tool poisoning, rug pull, secret leak, DoS inputs, audit tamper), ported/reference-aligned to `reference/tests`.
@@ -96,7 +96,7 @@ Artifacts include `bench-junit.xml`, `bench-latency.json`, `bench-summary.json`,
 - `--bench-mode` / `--gateway-url`: override report metadata (defaults: `$SCOPEGATE_BENCH_MODE`/`baseline`, `$SCOPEGATE_GATEWAY_URL`).
 
 ## Scenario coverage and porting notes
-Local-model coverage includes scope attenuation/no-inflation/ordering/revocation, routing/tool-poisoning invariants (unknown-capability clean failures + benign routing), malformed/oversized/depth/list/pow/expression/budget DoS bounds with typed clean failures, hash-chain tamper/removal/ordering/integrity detection with scale/overhead checks, secret-redaction and taint/egress/rug-pull drift models, and latency/overhead measurement hooks. Gateway-dependent/live classes (injection exfil, confused-deputy isolation, rug pull, secret leak, live policy/health/latency probes) are explicit xfail until endpoint/configured and wired.
+Local-model coverage includes scope attenuation/no-inflation/ordering/revocation, routing/tool-poisoning invariants (unknown-capability clean failures + benign routing), malformed/oversized/depth/list/pow/expression/budget DoS bounds with typed clean failures, hash-chain tamper/removal/ordering/integrity detection with scale/overhead checks, secret-redaction and taint/egress/rug-pull drift models, and latency/overhead measurement hooks. Gateway-dependent/live classes (injection exfil, confused-deputy isolation, rug pull, secret leak, live policy/health/latency probes) are env-gated xfail when endpoint/evidence is unavailable and can pass when configured with observable enforcement evidence.
 
 Live enforcement evidence path: run `SCOPEGATE_GATEWAY_URL=http://localhost:8080 ./bench/run_local_gateway.sh enforce` against a local gateway; live probe/policy/latency checks execute when reachable and artifacts capture JUnit, instrumented latency, JSON/MD reports, and README table output.
 

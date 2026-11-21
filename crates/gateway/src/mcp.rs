@@ -966,7 +966,36 @@ pub async fn handle_mcp_request_async_with_context(
 ) -> McpResponse {
     let parsed = match parse_raw(&req) {
         Ok(v) => v,
-        Err(e) => return e,
+        Err(e) => {
+            let raw = if !req.payload_json.trim().is_empty() {
+                req.payload_json.as_str()
+            } else {
+                req.method.as_str()
+            };
+            emit(state, "mcp.error", "parse error (fail-closed)", None);
+            if append_mcp_audit(
+                state,
+                None,
+                "<parse_error>",
+                "deny",
+                Some("parse_error".into()),
+                Some(digest(raw)),
+                None,
+            )
+            .await
+            .is_err()
+                && state.config.fail_closed
+            {
+                emit(
+                    state,
+                    "mcp.error",
+                    "Audit append failed (fail-closed)",
+                    None,
+                );
+                return jsonrpc_error(Value::Null, -32000, "Audit append failed (fail-closed)");
+            }
+            return e;
+        }
     };
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
     let method = parsed
@@ -1725,14 +1754,37 @@ pub async fn handle_mcp_request_async_with_context(
                     }
                 }
             }
+            let result_digest = digest(&r.to_string());
+            let resp_payload = json!({"jsonrpc":"2.0","id":id.clone(),"result":r}).to_string();
+            let (final_resp, audit_decision, audit_reason, emit_kind, emit_msg) =
+                match scrub_agent_visible_payload(&resp_payload) {
+                    Ok(scrubbed) => (
+                        McpResponse {
+                            ok: true,
+                            payload_json: scrubbed,
+                            fail_closed: false,
+                        },
+                        "allow",
+                        None,
+                        "mcp.response",
+                        "ok".to_string(),
+                    ),
+                    Err(scrub_reason) => (
+                        jsonrpc_error(id.clone(), -32003, "Secret redaction failed (fail-closed)"),
+                        "deny",
+                        Some(format!("secret_redaction_failed:{scrub_reason}")),
+                        "mcp.error",
+                        "Secret redaction failed (fail-closed)".to_string(),
+                    ),
+                };
             let audit_res = append_mcp_audit(
                 state,
                 task_id.clone(),
                 &method,
-                "allow",
-                None,
+                audit_decision,
+                audit_reason,
                 Some(digest(&parsed.to_string())),
-                Some(digest(&r.to_string())),
+                Some(result_digest),
             )
             .await;
             if audit_res.is_err() && state.config.fail_closed {
@@ -1744,12 +1796,8 @@ pub async fn handle_mcp_request_async_with_context(
                 );
                 return jsonrpc_error(id, -32000, "Audit append failed (fail-closed)");
             }
-            emit(state, "mcp.response", "ok", task_id);
-            finalize_mcp_response(McpResponse {
-                ok: true,
-                payload_json: json!({"jsonrpc":"2.0","id":id,"result":r}).to_string(),
-                fail_closed: false,
-            })
+            emit(state, emit_kind, &emit_msg, task_id);
+            final_resp
         }
         Err(e) => {
             let (code, msg) = dispatch_error_to_jsonrpc(&e);
@@ -2616,6 +2664,25 @@ mod tests {
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         // audit append-before-return takes precedence for durable fail-closed behavior
+        assert_eq!(v["error"]["code"], -32000);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Audit append failed"));
+    }
+
+    #[tokio::test]
+    async fn parse_error_fails_closed_when_audit_append_fails() {
+        let store: Arc<dyn store::Store> = Arc::new(FailingAuditStore);
+        let state = AppState::fail_closed().with_store(store);
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: "{not-json".into(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32000);
         assert!(v["error"]["message"]
             .as_str()

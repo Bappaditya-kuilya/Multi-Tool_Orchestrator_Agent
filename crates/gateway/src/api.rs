@@ -2156,4 +2156,163 @@ mod tests {
             );
         });
     }
+
+    #[derive(Debug, Default)]
+    struct FailingAuditStore;
+
+    #[async_trait::async_trait]
+    impl store::Store for FailingAuditStore {
+        fn backend(&self) -> store::BackendKind {
+            store::BackendKind::InMemory
+        }
+        async fn append_audit_event(
+            &self,
+            _event: store::AuditEvent,
+        ) -> store::StoreResult<store::AuditEvent> {
+            Err(store::StoreError::Unavailable(
+                "simulated audit append failure".into(),
+            ))
+        }
+        async fn query_audit(
+            &self,
+            _query: store::AuditQuery,
+        ) -> store::StoreResult<Vec<store::AuditEvent>> {
+            Ok(vec![])
+        }
+        async fn verify_audit_chain(&self) -> store::StoreResult<store::AuditVerificationReport> {
+            Ok(store::AuditVerificationReport {
+                ok: true,
+                ..Default::default()
+            })
+        }
+        async fn create_approval(
+            &self,
+            approval: store::ApprovalRecord,
+        ) -> store::StoreResult<store::ApprovalRecord> {
+            Ok(approval)
+        }
+        async fn get_approval(
+            &self,
+            _id: &str,
+        ) -> store::StoreResult<Option<store::ApprovalRecord>> {
+            Ok(None)
+        }
+        async fn list_approvals(
+            &self,
+            _query: store::ApprovalQuery,
+        ) -> store::StoreResult<Vec<store::ApprovalRecord>> {
+            Ok(vec![])
+        }
+        async fn resolve_approval(
+            &self,
+            _id: &str,
+            _status: store::ApprovalStatus,
+            _resolver: Option<String>,
+            _resolved_at: String,
+        ) -> store::StoreResult<store::ApprovalRecord> {
+            Err(store::StoreError::NotFound("not found".into()))
+        }
+        async fn upsert_task(
+            &self,
+            task: store::TaskRecord,
+        ) -> store::StoreResult<store::TaskRecord> {
+            Ok(task)
+        }
+        async fn get_task(&self, _id: &str) -> store::StoreResult<Option<store::TaskRecord>> {
+            Ok(None)
+        }
+        async fn list_tasks(
+            &self,
+            _query: store::TaskQuery,
+        ) -> store::StoreResult<Vec<store::TaskRecord>> {
+            Ok(vec![])
+        }
+        async fn upsert_policy(
+            &self,
+            policy: store::PolicyRecord,
+        ) -> store::StoreResult<store::PolicyRecord> {
+            Ok(policy)
+        }
+        async fn get_active_policy(&self) -> store::StoreResult<Option<store::PolicyRecord>> {
+            Ok(None)
+        }
+        async fn record_revocation(
+            &self,
+            record: store::RevocationRecord,
+        ) -> store::StoreResult<store::RevocationRecord> {
+            Ok(record)
+        }
+        async fn list_revocations(
+            &self,
+            _query: store::RevocationQuery,
+        ) -> store::StoreResult<Vec<store::RevocationRecord>> {
+            Ok(vec![])
+        }
+        async fn record_taint_snapshot(
+            &self,
+            snapshot: store::TaintSnapshotRecord,
+        ) -> store::StoreResult<store::TaintSnapshotRecord> {
+            Ok(snapshot)
+        }
+        async fn list_taint_snapshots(
+            &self,
+            _query: store::TaintSnapshotQuery,
+        ) -> store::StoreResult<Vec<store::TaintSnapshotRecord>> {
+            Ok(vec![])
+        }
+        async fn get_tool_pin(
+            &self,
+            _upstream_id: &str,
+            _tool_name: &str,
+        ) -> store::StoreResult<Option<store::ToolPinRecord>> {
+            Ok(None)
+        }
+        async fn upsert_tool_pin(
+            &self,
+            record: store::ToolPinRecord,
+        ) -> store::StoreResult<store::ToolPinRecord> {
+            Ok(record)
+        }
+        async fn save_rate_limit_snapshot(
+            &self,
+            snapshot: store::RateLimitSnapshotRecord,
+        ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+            Ok(snapshot)
+        }
+        async fn load_rate_limit_snapshot(
+            &self,
+        ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+            Ok(None)
+        }
+        async fn health_check(&self) -> store::StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn task_create_fails_closed_when_audit_append_fails() {
+        rt().block_on(async {
+            let mut st = AppState::fail_closed().with_store(Arc::new(FailingAuditStore));
+            st.config = st.config.clone().with_rules(vec![Rule::exact(
+                "agent",
+                "tool.invoke",
+                "tool",
+                PolicyDecision::Permit,
+            )]);
+
+            let resp = handle_v1_tasks(&st, task_req()).await;
+            assert_eq!(resp.status, HttpStatus::ServiceUnavailable);
+            assert!(resp.fail_closed);
+            assert!(resp
+                .error
+                .unwrap_or_default()
+                .contains("audit append failed (fail-closed)"));
+            assert!(
+                st.metrics
+                    .audit_append_failures
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= 1
+            );
+        });
+    }
 }

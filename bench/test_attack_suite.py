@@ -156,16 +156,95 @@ def test_confused_deputy_cross_task_or_authority_confusion(bench_mode: str) -> N
     assert forged["correlation_id"] != request_id
 
 
+@pytest.mark.live
 @pytest.mark.confused_deputy
-def test_confused_deputy_gateway_isolation_enforcement(bench_mode: str) -> None:
-    pytest.xfail(
-        "gateway-dependent xfail (not live-e2e wired in bench harness): "
-        "gateway MCP handler no longer holds a global AppState mutex across dispatch; mutable "
-        "subsystems use internal locks. Concurrent server/router isolation is proven by Rust "
-        "integration test crates/gateway/tests/integration.rs::mcp_concurrent_requests_are_isolated_through_router "
-        "and handler request-binding tests in crates/gateway/src/mcp.rs. Bench remains xfail because "
-        "this harness does not exercise a live concurrent gateway MCP path."
-    )
+def test_confused_deputy_gateway_isolation_enforcement(gateway_url: str) -> None:
+    """Live E2E: concurrent MCP requests through /mcp keep response ids isolated.
+
+    Proven when configured: sends concurrent JSON-RPC requests with distinct ids and
+    asserts each response echoes its own id with no cross-delivery of other request ids.
+    Complements Rust proof in
+    crates/gateway/tests/integration.rs::mcp_concurrent_requests_are_isolated_through_router.
+    """
+    import concurrent.futures
+    import uuid
+
+    url = require_live_gateway(gateway_url)
+    gw = get_live_gateway(url)
+    assert gw is not None
+
+    ok, info = gw.probe()
+    if not ok:
+        pytest.xfail(f"gateway configured but unreachable at {url}: {info}")
+
+    req_ids = [f"iso-{i}-{uuid.uuid4().hex}" for i in range(20)]
+    requests = [
+        {"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}}
+        for rid in req_ids
+    ]
+
+    def _send(rpc: dict[str, Any]) -> tuple[str, int, Any, dict[str, Any] | None]:
+        rid = str(rpc["id"])
+        status, body, _ = mcp_post_jsonrpc(gw, rpc)
+        inner: dict[str, Any] | None = None
+        if isinstance(body, dict) and isinstance(body.get("payload_json"), str):
+            try:
+                parsed = json.loads(body["payload_json"])
+                if isinstance(parsed, dict):
+                    inner = parsed
+            except Exception:
+                inner = None
+        elif isinstance(body, dict):
+            # raw JSON-RPC fallback accepted by mcp_post_jsonrpc
+            if body.get("jsonrpc") == "2.0" or "id" in body or "result" in body or "error" in body:
+                inner = body
+        return rid, status, body, inner
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(requests))) as pool:
+        results = list(pool.map(_send, requests))
+
+    if not results:
+        pytest.xfail("no concurrent gateway responses collected")
+
+    connect_failures = [r for r in results if r[1] == 0]
+    if connect_failures:
+        pytest.xfail(
+            f"gateway configured but concurrent MCP calls failed to connect ({len(connect_failures)}/{len(results)}): "
+            f"{connect_failures[0][2]!r}"
+        )
+
+    seen_ids: set[str] = set()
+    unprovable: list[str] = []
+    for req_id, status, body, inner in results:
+        assert status != 0, f"gateway call failed to connect for {req_id}: {body!r}"
+        assert isinstance(body, dict), f"expected MCP wrapper/object for {req_id}, got {status} {body!r}"
+        if inner is None or "id" not in inner:
+            unprovable.append(f"{req_id}: status={status} body={body!r}")
+            continue
+        assert inner.get("id") == req_id, (
+            f"response id mismatch/cross-delivery: expected {req_id}, got {inner.get('id')!r}; body={body!r}"
+        )
+        payload_json = body.get("payload_json")
+        if isinstance(payload_json, str):
+            for other_id in req_ids:
+                if other_id != req_id:
+                    assert other_id not in payload_json, (
+                        f"cross-delivery evidence: response for {req_id} contains foreign id {other_id}: {payload_json!r}"
+                    )
+        seen_ids.add(req_id)
+
+    if unprovable and not seen_ids:
+        pytest.xfail(
+            "gateway configured but concurrent MCP responses were not parseable JSON-RPC id evidence; "
+            f"cannot prove isolation reliably on this endpoint ({len(unprovable)}/{len(results)} unprovable): "
+            + "; ".join(unprovable[:3])
+        )
+    if unprovable:
+        pytest.xfail(
+            "some concurrent MCP responses lacked parseable JSON-RPC id evidence; "
+            f"cannot prove full isolation reliably ({len(unprovable)}/{len(results)}): " + "; ".join(unprovable[:3])
+        )
+    assert seen_ids == set(req_ids), f"missing/extra response ids: expected {len(req_ids)}, got {seen_ids!r}"
 
 
 @pytest.mark.tool_poisoning
