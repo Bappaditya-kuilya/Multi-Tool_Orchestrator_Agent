@@ -12,14 +12,13 @@ use axum::response::{
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::api::{self, routes, ApiResponse, HttpStatus};
 use crate::mcp;
 use crate::state::AppState;
 
-pub type SharedState = Arc<Mutex<AppState>>;
+pub type SharedState = Arc<AppState>;
 
 pub fn router(state: SharedState) -> Router {
     let app: Router<SharedState> = Router::new()
@@ -94,17 +93,14 @@ fn jsonrpc_error_value(id: serde_json::Value, code: i64, message: &str) -> serde
 }
 
 async fn healthz(State(state): State<SharedState>) -> Response {
-    let st = state.lock().await;
-    json_response(api::handle_healthz(&st.config))
+    json_response(api::handle_healthz(&state.config))
 }
 
 async fn readyz(State(state): State<SharedState>) -> Response {
-    let (has_store, has_broker, store) = {
-        let st = state.lock().await;
-        (st.has_store(), st.has_broker(), st.store.clone())
-    };
+    let has_store = state.has_store();
+    let has_broker = state.has_broker();
     let ready_store = if has_store {
-        match store {
+        match &state.store {
             Some(s) => s.health_check().await.is_ok(),
             None => false,
         }
@@ -137,8 +133,7 @@ async fn readyz(State(state): State<SharedState>) -> Response {
 }
 
 async fn metrics(State(state): State<SharedState>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_metrics(&st);
+    let resp = api::handle_metrics(&state);
     let body = resp.body.map(|b| b.body).unwrap_or_default();
     (
         StatusCode::OK,
@@ -152,20 +147,17 @@ async fn v1_tasks(
     State(state): State<SharedState>,
     Json(req): Json<api::TaskCreateRequest>,
 ) -> Response {
-    let mut st = state.lock().await;
-    let resp = api::handle_v1_tasks(&mut st, req).await;
+    let resp = api::handle_v1_tasks(&state, req).await;
     json_response(resp)
 }
 
 async fn v1_tasks_list(State(state): State<SharedState>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_tasks_list(&st).await;
+    let resp = api::handle_v1_tasks_list(&state).await;
     json_response(resp)
 }
 
 async fn v1_task_get(State(state): State<SharedState>, Path(id): Path<String>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_task_get(&st, &id).await;
+    let resp = api::handle_v1_task_get(&state, &id).await;
     json_response(resp)
 }
 
@@ -179,8 +171,7 @@ async fn v1_task_revoke(
     } else {
         serde_json::from_slice::<api::TaskRevokeRequest>(&body).unwrap_or_default()
     };
-    let st = state.lock().await;
-    let resp = api::handle_v1_task_revoke(&st, &id, req).await;
+    let resp = api::handle_v1_task_revoke(&state, &id, req).await;
     json_response(resp)
 }
 
@@ -188,8 +179,7 @@ async fn v1_audit_get(
     State(state): State<SharedState>,
     Query(req): Query<api::AuditQueryRequest>,
 ) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_audit(&st, req).await;
+    let resp = api::handle_v1_audit(&state, req).await;
     json_response(resp)
 }
 
@@ -197,14 +187,12 @@ async fn v1_audit_post(
     State(state): State<SharedState>,
     Json(req): Json<api::AuditQueryRequest>,
 ) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_audit(&st, req).await;
+    let resp = api::handle_v1_audit(&state, req).await;
     json_response(resp)
 }
 
 async fn v1_audit_verify(State(state): State<SharedState>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_audit_verify(&st).await;
+    let resp = api::handle_v1_audit_verify(&state).await;
     json_response(resp)
 }
 
@@ -212,8 +200,7 @@ async fn v1_approvals(
     State(state): State<SharedState>,
     Json(req): Json<api::ApprovalDecisionRequest>,
 ) -> Response {
-    let mut st = state.lock().await;
-    let resp = api::handle_v1_approvals(&mut st, req).await;
+    let resp = api::handle_v1_approvals(&state, req).await;
     json_response(resp)
 }
 
@@ -221,14 +208,12 @@ async fn v1_approvals_list(
     State(state): State<SharedState>,
     Query(req): Query<api::ApprovalListQueryRequest>,
 ) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_approvals_list(&st, req).await;
+    let resp = api::handle_v1_approvals_list(&state, req).await;
     json_response(resp)
 }
 
 async fn v1_approval_get(State(state): State<SharedState>, Path(id): Path<String>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_approval_get(&st, &id).await;
+    let resp = api::handle_v1_approval_get(&state, &id).await;
     json_response(resp)
 }
 
@@ -242,14 +227,12 @@ async fn v1_approval_resolve(
     } else {
         serde_json::from_slice::<api::ApprovalPathResolveRequest>(&body).unwrap_or_default()
     };
-    let mut st = state.lock().await;
-    let resp = api::handle_v1_approval_resolve(&mut st, &id, req).await;
+    let resp = api::handle_v1_approval_resolve(&state, &id, req).await;
     json_response(resp)
 }
 
 async fn v1_policies_get(State(state): State<SharedState>) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_policies(&st, None).await;
+    let resp = api::handle_v1_policies(&state, None).await;
     json_response(resp)
 }
 
@@ -257,16 +240,12 @@ async fn v1_policies_post(
     State(state): State<SharedState>,
     Json(req): Json<api::PolicyUpsertRequest>,
 ) -> Response {
-    let st = state.lock().await;
-    let resp = api::handle_v1_policies(&st, Some(req)).await;
+    let resp = api::handle_v1_policies(&state, Some(req)).await;
     json_response(resp)
 }
 
 async fn v1_stream(State(state): State<SharedState>) -> Response {
-    let rx = {
-        let st = state.lock().await;
-        st.events_tx.subscribe()
-    };
+    let rx = state.events_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|msg| match msg {
         Ok(data) => Some(Ok::<Event, Infallible>(
             Event::default().event("gateway").data(data),
@@ -387,17 +366,15 @@ async fn mcp_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let resp = {
-        let mut st = state.lock().await;
-        mcp::handle_mcp_request_async_with_context(
-            &mut st,
-            req,
-            mcp::McpHttpContext {
-                authorization: auth,
-            },
-        )
-        .await
-    };
+    // Narrow locking: MCP dispatch uses internal subsystem locks; no global AppState mutex held.
+    let resp = mcp::handle_mcp_request_async_with_context(
+        &state,
+        req,
+        mcp::McpHttpContext {
+            authorization: auth,
+        },
+    )
+    .await;
     let status = mcp_http_status(&resp);
     if raw_jsonrpc {
         if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&resp.payload_json) {
@@ -418,7 +395,7 @@ mod tests {
 
     fn app_state() -> SharedState {
         let store = Arc::new(store::InMemoryStore::default()) as Arc<dyn store::Store>;
-        Arc::new(Mutex::new(AppState::fail_closed().with_store(store)))
+        Arc::new(AppState::fail_closed().with_store(store))
     }
 
     #[tokio::test]

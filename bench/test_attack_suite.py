@@ -159,13 +159,12 @@ def test_confused_deputy_cross_task_or_authority_confusion(bench_mode: str) -> N
 @pytest.mark.confused_deputy
 def test_confused_deputy_gateway_isolation_enforcement(bench_mode: str) -> None:
     pytest.xfail(
-        "gateway-dependent xfail (concurrent isolation not proven; request-binding guards enforced): "
-        "gateway MCP handler is serialized by a global AppState lock in server.rs, so concurrent "
-        "cross-task interleaving on the live MCP path is not exercised. Handler logic now has "
-        "explicit per-request binding tests proving JSON-RPC id/task_id/approval/task context "
-        "are request-local and not mixed across sequential requests on shared state; "
-        "see crates/gateway/src/mcp.rs isolation tests. True concurrent multi-request isolation "
-        "remains unproven until the global lock is narrowed/replaced with concurrent dispatch proof."
+        "gateway-dependent xfail (not live-e2e wired in bench harness): "
+        "gateway MCP handler no longer holds a global AppState mutex across dispatch; mutable "
+        "subsystems use internal locks. Concurrent server/router isolation is proven by Rust "
+        "integration test crates/gateway/tests/integration.rs::mcp_concurrent_requests_are_isolated_through_router "
+        "and handler request-binding tests in crates/gateway/src/mcp.rs. Bench remains xfail because "
+        "this harness does not exercise a live concurrent gateway MCP path."
     )
 
 

@@ -5,10 +5,9 @@ use axum::http::{Request, StatusCode};
 use gateway::{config, mcp, server, state::AppState};
 use serde_json::json;
 use store::InMemoryStore;
-use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-fn app_state() -> Arc<Mutex<AppState>> {
+fn app_state() -> Arc<AppState> {
     let store = Arc::new(InMemoryStore::default()) as Arc<dyn store::Store>;
     let mut cfg = config::GatewayConfig::default().with_rules(vec![
         scopegate_core::policy::Rule::exact(
@@ -34,7 +33,7 @@ fn app_state() -> Arc<Mutex<AppState>> {
     let mut app = AppState::fail_closed().with_store(store);
     app.config = cfg;
     app.configure_mcp_runtime();
-    Arc::new(Mutex::new(app))
+    Arc::new(app)
 }
 
 #[tokio::test]
@@ -224,17 +223,98 @@ async fn mcp_fails_closed_when_denied() {
     let app_state = {
         let mut app = AppState::fail_closed().with_store(store);
         app.config = config::GatewayConfig::default(); // no permit rules, no active policy
-        Arc::new(Mutex::new(app))
+        Arc::new(app)
     };
     let req = mcp::McpRequest {
         method: String::new(),
         payload_json: json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"gateway.health","principal":"anonymous"}}).to_string(),
         upstream: None,
     };
-    let resp = {
-        let mut st = app_state.lock().await;
-        mcp::handle_mcp_request_async(&mut st, req).await
-    };
+    let resp = mcp::handle_mcp_request_async(&app_state, req).await;
     assert!(resp.fail_closed);
     assert!(!resp.ok);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_concurrent_requests_are_isolated_through_router() {
+    let state = app_state();
+    {
+        let st = state.clone();
+        let store = st.store.as_ref().unwrap();
+        for (tid, aid) in [("task-a", "ap-a"), ("task-b", "ap-b")] {
+            store
+                .upsert_task(store::TaskRecord {
+                    id: tid.into(),
+                    token_id: "tok".into(),
+                    scopes: "[]".into(),
+                    budget: 1,
+                    expires_at: "later".into(),
+                    revoked: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            store
+                .create_approval(store::ApprovalRecord {
+                    id: aid.into(),
+                    task_id: tid.into(),
+                    tool: "gateway.health".into(),
+                    args_hash: "h".into(),
+                    status: store::ApprovalStatus::Approved,
+                    created_at: "now".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    let app = server::router(state.clone());
+
+    let mk = |id: i64, task_id: &str, approval_id: &str| {
+        let payload = json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"gateway.health","task_id":task_id,"approval_id":approval_id,"principal":"anonymous"}
+        });
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..20i64 {
+        let app = app.clone();
+        let (id, tid, aid, other_tid) = if i % 2 == 0 {
+            (1000 + i, "task-a", "ap-a", "task-b")
+        } else {
+            (1000 + i, "task-b", "ap-b", "task-a")
+        };
+        set.spawn(async move {
+            let res = app.oneshot(mk(id, tid, aid)).await.unwrap();
+            let status = res.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            (id, tid.to_string(), other_tid.to_string(), status, body)
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        let (id, tid, other_tid, status, body) = res.unwrap();
+        assert_eq!(status, StatusCode::OK, "id={id} tid={tid} body={body}");
+        // Router returns raw JSON-RPC for raw JSON-RPC requests.
+        assert_eq!(body["id"], id, "jsonrpc id must be request-local: {body}");
+        assert_eq!(
+            body["result"]["structuredContent"]["ok"], true,
+            "id={id} body={body}"
+        );
+        let payload_str = body.to_string();
+        assert!(
+            !payload_str.contains(&format!("\"{}\"", other_tid)),
+            "cross-task leakage for id={id} tid={tid}: {payload_str}"
+        );
+    }
 }

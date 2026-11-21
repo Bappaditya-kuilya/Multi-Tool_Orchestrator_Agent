@@ -15,7 +15,7 @@ Current verified baseline (2026-11-17, capture fresh evidence/logs):
 - cargo fmt --all --check: PASS
 - cargo clippy --all-targets --all-features -- -D warnings: PASS
 - cargo test --all: PASS
-- bench: 38 passed, 7 xfailed (record mode/commit/env/output)
+- bench: unconfigured 38 passed, 7 xfailed; configured clean-gateway/data-dir capture 44 passed, 1 xfailed (env-gated capability tests; same-instance rerun stateful contamination caveat; not enforce-mode sign-off). Record mode/commit/env/output
 - dashboard build: PASS
 
 Build & quality (Rust toolchain required)

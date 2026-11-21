@@ -462,7 +462,7 @@ pub fn handle_metrics(state: &AppState) -> ApiResponse<MetricsResponse> {
 }
 
 pub async fn handle_v1_tasks(
-    state: &mut AppState,
+    state: &AppState,
     req: TaskCreateRequest,
 ) -> ApiResponse<TaskRecordView> {
     let Some(store) = state.store.clone() else {
@@ -774,7 +774,7 @@ pub async fn handle_v1_audit_verify(
 }
 
 pub async fn handle_v1_approvals(
-    state: &mut AppState,
+    state: &AppState,
     req: ApprovalDecisionRequest,
 ) -> ApiResponse<ApprovalView> {
     let Some(store) = state.store.clone() else {
@@ -803,11 +803,11 @@ pub async fn handle_v1_approvals(
         let expected_tool = areq.action.clone();
         let expected_args_hash = req.args_hash.clone().unwrap_or_default();
 
-        if let Err(e) =
-            state
-                .approvals
-                .create_with_binding(areq.clone(), req.expires_at, req.args_hash.clone())
-        {
+        let create_res = {
+            let mut approvals = state.approvals.lock().expect("approvals lock");
+            approvals.create_with_binding(areq.clone(), req.expires_at, req.args_hash.clone())
+        };
+        if let Err(e) = create_res {
             // allow conflict if same record semantics not critical; fail closed otherwise
             if !matches!(e, broker::BrokerError::DuplicateApproval(_)) {
                 return ApiResponse::conflict(format!("approval create failed: {e:?}"));
@@ -891,7 +891,11 @@ pub async fn handle_v1_approvals(
     {
         Ok(r) => {
             // Update broker best-effort for in-process consistency.
-            let _ = state.approvals.resolve(&req.id, decision, now);
+            let _ = state
+                .approvals
+                .lock()
+                .expect("approvals lock")
+                .resolve(&req.id, decision, now);
             state.emit_event(crate::state::StreamEvent {
                 kind: "approval.resolved".into(),
                 message: format!("{}:{:?}", r.id, r.status),
@@ -908,7 +912,11 @@ pub async fn handle_v1_approvals(
             match store.get_approval(&req.id).await {
                 Ok(Some(existing)) if existing.status == store_status => {
                     // Idempotent resolve replay for the same terminal decision.
-                    let _ = state.approvals.resolve(&req.id, decision, now);
+                    let _ = state
+                        .approvals
+                        .lock()
+                        .expect("approvals lock")
+                        .resolve(&req.id, decision, now);
                     ApiResponse::ok(ApprovalView {
                         id: existing.id,
                         status: format!("{:?}", existing.status).to_lowercase(),
@@ -981,6 +989,8 @@ pub async fn handle_v1_approvals_list(
         .collect::<std::collections::HashSet<_>>();
     let mut ids = state
         .approvals
+        .lock()
+        .expect("approvals lock")
         .snapshot()
         .into_iter()
         .map(|r| r.request.id)
@@ -1038,7 +1048,7 @@ pub async fn handle_v1_approval_get(
 }
 
 pub async fn handle_v1_approval_resolve(
-    state: &mut AppState,
+    state: &AppState,
     id: &str,
     req: ApprovalPathResolveRequest,
 ) -> ApiResponse<ApprovalView> {
@@ -1205,8 +1215,8 @@ mod tests {
     #[test]
     fn tasks_wired_to_lifecycle_and_store() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let resp = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(resp.status, HttpStatus::Ok);
             let body = resp.body.unwrap();
             assert_eq!(body.state, "allowed");
@@ -1218,8 +1228,8 @@ mod tests {
     #[test]
     fn task_get_and_revoke_endpoints() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let _ = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let _ = handle_v1_tasks(&st, task_req()).await;
 
             let got = handle_v1_task_get(&st, "t1").await;
             assert_eq!(got.status, HttpStatus::Ok);
@@ -1282,8 +1292,8 @@ mod tests {
     #[test]
     fn audit_query_and_verify_from_store() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let _ = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let _ = handle_v1_tasks(&st, task_req()).await;
             let resp = handle_v1_audit(
                 &st,
                 AuditQueryRequest {
@@ -1324,9 +1334,9 @@ mod tests {
     #[test]
     fn approvals_broker_and_store_flow() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let created = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a1".into(),
                     action: Some("create".into()),
@@ -1340,7 +1350,7 @@ mod tests {
             .await;
             assert_eq!(created.status, HttpStatus::Ok);
             let resolved = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a1".into(),
                     action: Some("approve".into()),
@@ -1357,9 +1367,9 @@ mod tests {
     #[test]
     fn approval_resolve_is_idempotent_for_same_decision() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let _ = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a-idem".into(),
                     action: Some("create".into()),
@@ -1372,7 +1382,7 @@ mod tests {
             )
             .await;
             let first = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 "a-idem",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -1383,7 +1393,7 @@ mod tests {
             .await;
             assert_eq!(first.status, HttpStatus::Ok);
             let second = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 "a-idem",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -1419,9 +1429,9 @@ mod tests {
     #[test]
     fn approvals_list_get_and_path_resolve() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let _ = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a1".into(),
                     action: Some("create".into()),
@@ -1434,7 +1444,7 @@ mod tests {
             )
             .await;
             let _ = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a2".into(),
                     action: Some("create".into()),
@@ -1470,7 +1480,7 @@ mod tests {
             assert_eq!(got.body.unwrap().task_id, "task-a");
 
             let resolved = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 "a2",
                 ApprovalPathResolveRequest {
                     action: Some("deny".into()),
@@ -1492,7 +1502,7 @@ mod tests {
     #[test]
     fn approvals_list_get_resolve_fail_closed_without_store() {
         rt().block_on(async {
-            let mut st = AppState::fail_closed();
+            let st = AppState::fail_closed();
             let list = handle_v1_approvals_list(&st, ApprovalListQueryRequest::default()).await;
             assert_eq!(list.status, HttpStatus::ServiceUnavailable);
             assert!(list.fail_closed);
@@ -1502,7 +1512,7 @@ mod tests {
             assert!(got.fail_closed);
 
             let resolved = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 "a1",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -1518,12 +1528,12 @@ mod tests {
     #[test]
     fn approval_get_and_path_resolve_validate_id() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let got = handle_v1_approval_get(&st, "").await;
             assert_eq!(got.status, HttpStatus::BadRequest);
             assert!(got.fail_closed);
             let resolved = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 " ",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -1567,8 +1577,8 @@ mod tests {
     #[test]
     fn denied_task_persists_deny_audit_before_return() {
         rt().block_on(async {
-            let mut st = deny_all_rules_state();
-            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            let st = deny_all_rules_state();
+            let resp = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(resp.status, HttpStatus::Forbidden);
             assert!(resp.fail_closed);
             assert_eq!(resp.body.as_ref().unwrap().state, "denied");
@@ -1624,10 +1634,10 @@ mod tests {
     #[test]
     fn tasks_require_token_and_fail_closed_on_bad_input() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let mut bad = task_req();
             bad.token = None;
-            let resp = handle_v1_tasks(&mut st, bad).await;
+            let resp = handle_v1_tasks(&st, bad).await;
             assert_eq!(resp.status, HttpStatus::BadRequest);
             assert!(resp.fail_closed);
             assert!(resp.error.unwrap_or_default().contains("token"));
@@ -1637,7 +1647,7 @@ mod tests {
     #[test]
     fn tasks_require_core_fields() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             for req in [
                 {
                     let mut r = task_req();
@@ -1660,7 +1670,7 @@ mod tests {
                     r
                 },
             ] {
-                let resp = handle_v1_tasks(&mut st, req).await;
+                let resp = handle_v1_tasks(&st, req).await;
                 assert_eq!(resp.status, HttpStatus::BadRequest);
                 assert!(resp.fail_closed);
             }
@@ -1670,10 +1680,10 @@ mod tests {
     #[test]
     fn task_create_duplicate_is_conflict() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let first = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let first = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(first.status, HttpStatus::Ok);
-            let second = handle_v1_tasks(&mut st, task_req()).await;
+            let second = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(second.status, HttpStatus::Conflict);
             assert!(second.fail_closed);
             assert!(second.error.unwrap_or_default().contains("already exists"));
@@ -1683,8 +1693,8 @@ mod tests {
     #[test]
     fn task_revoke_is_idempotent() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let _ = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let _ = handle_v1_tasks(&st, task_req()).await;
             let first = handle_v1_task_revoke(
                 &st,
                 "t1",
@@ -1732,9 +1742,9 @@ mod tests {
     #[test]
     fn approval_create_conflict_is_store_backed_and_timeout_maps_to_expired() {
         rt().block_on(async {
-            let mut st = state_with_store();
+            let st = state_with_store();
             let created = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a-conf".into(),
                     action: Some("create".into()),
@@ -1753,7 +1763,7 @@ mod tests {
 
             // idempotent create returns existing pending record
             let created_again = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a-conf".into(),
                     action: Some("create".into()),
@@ -1770,7 +1780,7 @@ mod tests {
 
             // mismatched create payload for same ID fails closed as conflict
             let mismatched = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a-conf".into(),
                     action: Some("create".into()),
@@ -1791,7 +1801,7 @@ mod tests {
 
             // timeout resolves to expired in store-backed view
             let timed_out = handle_v1_approval_resolve(
-                &mut st,
+                &st,
                 "a-conf",
                 ApprovalPathResolveRequest {
                     action: Some("timeout".into()),
@@ -1811,7 +1821,7 @@ mod tests {
 
             // idempotent create replay after terminal resolution remains store-backed
             let replay_after_timeout = handle_v1_approvals(
-                &mut st,
+                &st,
                 ApprovalDecisionRequest {
                     id: "a-conf".into(),
                     action: Some("create".into()),
@@ -1831,8 +1841,8 @@ mod tests {
     #[test]
     fn audit_verify_endpoint_reports_store_state() {
         rt().block_on(async {
-            let mut st = state_with_store();
-            let _ = handle_v1_tasks(&mut st, task_req()).await;
+            let st = state_with_store();
+            let _ = handle_v1_tasks(&st, task_req()).await;
             let resp = handle_v1_audit_verify(&st).await;
             assert_eq!(resp.status, HttpStatus::Ok);
             assert!(resp.body.unwrap().ok);
@@ -1915,7 +1925,7 @@ mod tests {
                 PolicyDecision::Permit,
             )]);
 
-            let created = handle_v1_tasks(&mut st1, task_req()).await;
+            let created = handle_v1_tasks(&st1, task_req()).await;
             assert_eq!(created.status, HttpStatus::Ok);
 
             let policy_up = handle_v1_policies(
@@ -1946,7 +1956,7 @@ mod tests {
             assert_eq!(list.status, HttpStatus::Ok);
             assert_eq!(list.body.unwrap().tasks.len(), 1);
 
-            let dup = handle_v1_tasks(&mut st2, task_req()).await;
+            let dup = handle_v1_tasks(&st2, task_req()).await;
             assert_eq!(dup.status, HttpStatus::Conflict);
             assert!(dup.fail_closed);
 
@@ -1978,9 +1988,9 @@ mod tests {
             let store = Arc::new(InMemoryStore::default()) as Arc<dyn store::Store>;
 
             // Pre-restart: create pending approvals in durable store.
-            let mut st1 = AppState::fail_closed().with_store(store.clone());
+            let st1 = AppState::fail_closed().with_store(store.clone());
             let created = handle_v1_approvals(
-                &mut st1,
+                &st1,
                 ApprovalDecisionRequest {
                     id: "a-restart".into(),
                     action: Some("create".into()),
@@ -1995,7 +2005,7 @@ mod tests {
             assert_eq!(created.status, HttpStatus::Ok);
 
             let _ = handle_v1_approvals(
-                &mut st1,
+                &st1,
                 ApprovalDecisionRequest {
                     id: "a-restart-timeout".into(),
                     action: Some("create".into()),
@@ -2009,7 +2019,7 @@ mod tests {
             .await;
 
             // Post-restart: fresh broker/runtime state, same durable store.
-            let mut st2 = AppState::fail_closed().with_store(store.clone());
+            let st2 = AppState::fail_closed().with_store(store.clone());
 
             let listed = handle_v1_approvals_list(&st2, ApprovalListQueryRequest::default()).await;
             assert_eq!(listed.status, HttpStatus::Ok);
@@ -2021,7 +2031,7 @@ mod tests {
 
             // Resolve after restart must persist durably and be idempotent.
             let resolved = handle_v1_approval_resolve(
-                &mut st2,
+                &st2,
                 "a-restart",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -2035,7 +2045,7 @@ mod tests {
             assert_eq!(resolved.body.unwrap().status, "approved");
 
             let resolved_again = handle_v1_approval_resolve(
-                &mut st2,
+                &st2,
                 "a-restart",
                 ApprovalPathResolveRequest {
                     action: Some("approve".into()),
@@ -2047,7 +2057,7 @@ mod tests {
             assert_eq!(resolved_again.status, HttpStatus::Ok);
 
             let timed = handle_v1_approval_resolve(
-                &mut st2,
+                &st2,
                 "a-restart-timeout",
                 ApprovalPathResolveRequest {
                     action: Some("timeout".into()),
@@ -2104,7 +2114,7 @@ mod tests {
             st.config.runtime_hooks.sync_revocations_from_store = true;
 
             // No manual sync: API path must prepare runtime hooks and deny with restored revocation.
-            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            let resp = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(resp.status, HttpStatus::Forbidden);
             assert!(resp.fail_closed);
             let body = resp.body.unwrap();
@@ -2114,7 +2124,12 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("InvalidToken"));
-            assert!(st.config.revoked_token_ids.iter().any(|id| id == "r1"));
+            assert!(st
+                .effective_revoked_token_ids()
+                .await
+                .unwrap()
+                .iter()
+                .any(|id| id == "r1"));
         });
     }
 
@@ -2130,7 +2145,7 @@ mod tests {
             )]);
             st.config.runtime_hooks.sync_revocations_from_store = true;
 
-            let resp = handle_v1_tasks(&mut st, task_req()).await;
+            let resp = handle_v1_tasks(&st, task_req()).await;
             assert_eq!(resp.status, HttpStatus::ServiceUnavailable);
             assert!(resp.fail_closed);
             let err = resp.error.unwrap_or_default();

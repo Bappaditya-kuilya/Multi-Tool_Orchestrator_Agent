@@ -2,7 +2,7 @@
 
 Least-privilege MCP gateway for AI agents (Rust workspace). **Preview, not production-ready; no security/release sign-off.**
 
-> **Verification (current source, 2026-11-21):** `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` **green**. Bench: **38 passed, 7 xfailed** (baseline; not live enforce-mode proof). Dashboard `npm run build` and SDK checks (`py_compile`, `tsc --noEmit`) **green**. Evidence, not sign-off.
+> **Verification (current source, 2026-11-21):** `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` **green**. Bench: **38 passed, 7 xfailed** unconfigured; configured clean-gateway sqlite+stdio capture **44 passed, 1 xfailed** (3 capability tests pass when configured; same-instance rerun contamination caveat; evidence only). Dashboard `npm run build` and SDK checks (`py_compile`, `tsc --noEmit`) **green**. Not sign-off.
 >
 > **Captured sqlite+stdio S1 proof:** [`e2e/logs/proof-s1-source-20261120T194149Z/`](e2e/logs/proof-s1-source-20261120T194149Z/) (`sqlite_wal`, stdio upstream demo; manifest `scopegate.e2e_evidence_manifest.v1`, commit `2e16912`). Shows managed runtime/API flow evidence including MCP allow, deny (fail-closed), approval pending-deny → approved-allow, and `/v1/audit/verify` (`ok:true`, `checked_events:14` in captured probe). Not S1/S2 validation or sign-off.
 >
@@ -19,7 +19,7 @@ Least-privilege MCP gateway for AI agents (Rust workspace). **Preview, not produ
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
-python3 -m pytest bench -q              # 38 passed, 7 xfailed in recent baseline (env/live-dependent)
+python3 -m pytest bench -q              # 38 passed, 7 xfailed unconfigured; 44 passed, 1 xfailed on configured clean-gateway capture
 python3 -m py_compile sdk/python/src/scopegate_sdk/__init__.py
 cd dashboard && npm ci && npm run build && cd ..
 
@@ -56,7 +56,7 @@ Typical artifacts: `evidence-manifest.json` / `manifest.json`, API/MCP request-r
 
 - **Workspace:** `crates/{core,gateway,mcp-front,mcp-pool,broker,store}`. Axum gateway exposes ops/admin/MCP-dispatch routes (`/healthz`, `/readyz`, `/metrics`, `/v1/tasks*`, `/v1/approvals*`, `/v1/audit*`, `/v1/policies`, `/v1/stream`, `/mcp`) with fail-closed intent on key paths; not full `rmcp`/end-to-end upstream runtime.
 - **Store:** in-memory default; optional SQLite (WAL/sqlx) wiring with store-backed audit verification (`/v1/audit/verify`) in part. Captured sqlite+stdio proof/restart artifacts exist; durable end-to-end guarantees unproven.
-- **Bench/SDKs/dashboard:** 38p/7xf baseline harness; dashboard build + Python/TS static checks pass; clients/UI target evolving preview surfaces.
+- **Bench/SDKs/dashboard:** 38p/7xf unconfigured baseline, 44p/1x configured clean-gateway capture (evidence only); dashboard build + Python/TS static checks pass; clients/UI target evolving preview surfaces.
 - **Source of truth:** [`docs/STATUS.md`](docs/STATUS.md), [`docs/architecture.md`](docs/architecture.md), [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md).
 
 ## Remaining gaps & limitations

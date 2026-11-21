@@ -6,7 +6,6 @@ use std::sync::Arc;
 use gateway::{config, mcp, server, state::AppState};
 use store::{BackendKind, InMemoryStore, PostgresStore, SqliteStore, Store, StoreConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 
 fn stdio_mode_requested(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|a| a == "--stdio" || a == "stdio")
@@ -30,7 +29,7 @@ fn main() -> anyhow::Result<()> {
         .block_on(async_main())
 }
 
-async fn serve_stdio(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
+async fn serve_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -44,10 +43,7 @@ async fn serve_stdio(state: Arc<Mutex<AppState>>) -> anyhow::Result<()> {
             payload_json: trimmed.to_string(),
             upstream: None,
         };
-        let resp = {
-            let mut st = state.lock().await;
-            mcp::handle_mcp_request_async(&mut st, req).await
-        };
+        let resp = mcp::handle_mcp_request_async(&state, req).await;
         stdout.write_all(resp.payload_json.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
@@ -162,7 +158,7 @@ async fn async_main() -> anyhow::Result<()> {
     app.config = cfg;
     app.configure_mcp_runtime();
     // Fail closed when MCP upstreams are configured but runtime wiring is unavailable.
-    if !app.config.mcp_upstreams.is_empty() && app.mcp.is_none() {
+    if !app.config.mcp_upstreams.is_empty() && !app.has_mcp_runtime().await {
         anyhow::bail!(
             "startup MCP runtime wiring failed (fail-closed): configured upstreams unavailable"
         );
@@ -183,7 +179,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     let mode = app.config.mcp_mode;
-    let state = Arc::new(Mutex::new(app));
+    let state = Arc::new(app);
 
     match mode {
         config::McpMode::Stdio => {

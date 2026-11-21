@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -344,18 +344,20 @@ pub struct McpRuntime {
 
 /// Gateway application state.
 /// Store is abstracted behind `store::Store` trait; handlers fail closed when unavailable.
+/// Mutable subsystems use internal locks so MCP/API handlers can run concurrently without
+/// holding a global state mutex across async dispatch.
 pub struct AppState {
     pub config: GatewayConfig,
-    pub approvals: ApprovalQueue,
-    pub rate_tracker: Option<InMemoryRateLimitTracker>,
+    /// Runtime-synced revocation IDs merged into lifecycle/config checks without requiring &mut config.
+    pub(crate) synced_revocations: std::sync::Mutex<Vec<String>>,
+    pub approvals: std::sync::Mutex<ApprovalQueue>,
+    pub rate_tracker: std::sync::Mutex<Option<InMemoryRateLimitTracker>>,
     pub store: Option<Arc<dyn Store>>,
     pub metrics: Arc<Metrics>,
     pub events_tx: broadcast::Sender<String>,
-    pub mcp: Option<McpRuntime>,
+    pub mcp: tokio::sync::Mutex<Option<McpRuntime>>,
     /// Tracks whether in-memory rate/budget counters changed since last durable snapshot persist.
-    /// Sync handle paths mutate counters but cannot await persistence; callers should use
-    /// `handle_and_persist_audit` or `persist_rate_limit_snapshot_if_dirty` when durability is required.
-    pub(crate) rate_limit_snapshot_dirty: bool,
+    pub(crate) rate_limit_snapshot_dirty: AtomicBool,
 }
 
 impl Default for AppState {
@@ -370,13 +372,14 @@ impl AppState {
         let (events_tx, _) = broadcast::channel(128);
         Self {
             config: GatewayConfig::default(),
-            approvals: ApprovalQueue::new(),
-            rate_tracker: None,
+            synced_revocations: std::sync::Mutex::new(Vec::new()),
+            approvals: std::sync::Mutex::new(ApprovalQueue::new()),
+            rate_tracker: std::sync::Mutex::new(None),
             store: None,
             metrics: Arc::new(Metrics::default()),
             events_tx,
-            mcp: None,
-            rate_limit_snapshot_dirty: false,
+            mcp: tokio::sync::Mutex::new(None),
+            rate_limit_snapshot_dirty: AtomicBool::new(false),
         }
     }
 
@@ -385,8 +388,9 @@ impl AppState {
         self
     }
 
-    pub fn with_rate_tracker(mut self, tracker: InMemoryRateLimitTracker) -> Self {
-        self.rate_tracker = Some(tracker);
+    pub fn with_rate_tracker(self, tracker: InMemoryRateLimitTracker) -> Self {
+        // Builder on owned state; no concurrent access possible.
+        *self.rate_tracker.lock().expect("fresh state lock") = Some(tracker);
         self
     }
 
@@ -398,7 +402,14 @@ impl AppState {
     }
 
     pub fn has_rate_tracker(&self) -> bool {
-        self.rate_tracker.is_some()
+        self.rate_tracker
+            .lock()
+            .expect("rate tracker lock")
+            .is_some()
+    }
+
+    pub async fn has_mcp_runtime(&self) -> bool {
+        self.mcp.lock().await.is_some()
     }
 
     /// Helper for durable/store-backed integrations: whether audit persistence can be attempted.
@@ -409,13 +420,15 @@ impl AppState {
     /// Configure in-memory rate/budget tracker state from config hooks (fail-closed defaults).
     /// Preserves an existing tracker across repeated hook preparation to keep runtime rate/budget
     /// state continuity (S1 restart-safe/runtime lifecycle behavior) unless hooks are disabled.
-    pub fn configure_rate_limit_state(&mut self) {
+    pub fn configure_rate_limit_state(&self) {
+        let mut rt = self.rate_tracker.lock().expect("rate tracker lock");
         if !self.config.runtime_hooks.enable_rate_limit_state {
-            self.rate_tracker = None;
-            self.rate_limit_snapshot_dirty = false;
+            *rt = None;
+            self.rate_limit_snapshot_dirty
+                .store(false, Ordering::Relaxed);
             return;
         }
-        if self.rate_tracker.is_some() {
+        if rt.is_some() {
             return;
         }
         let limits = self.config.rate_limits.clone();
@@ -424,8 +437,9 @@ impl AppState {
             || limits.per_token_call_limit.is_some()
             || limits.per_token_budget.is_some();
         if configured {
-            self.rate_tracker = Some(InMemoryRateLimitTracker::new(limits));
-            self.rate_limit_snapshot_dirty = false;
+            *rt = Some(InMemoryRateLimitTracker::new(limits));
+            self.rate_limit_snapshot_dirty
+                .store(false, Ordering::Relaxed);
         }
     }
 
@@ -433,6 +447,13 @@ impl AppState {
     /// Fails closed (returns error) if a configured store query fails.
     pub async fn effective_revoked_token_ids(&self) -> Result<Vec<String>, String> {
         let mut merged = self.config.revoked_token_ids.clone();
+        if let Ok(synced) = self.synced_revocations.lock() {
+            for id in synced.iter() {
+                if !merged.iter().any(|x| x == id) {
+                    merged.push(id.clone());
+                }
+            }
+        }
         if self.store.is_some() && self.config.runtime_hooks.sync_revocations_from_store {
             let ids = self.load_revoked_token_ids_from_store().await?;
             for id in ids {
@@ -461,7 +482,7 @@ impl AppState {
 
     /// Sync store-backed revocations into config for synchronous lifecycle checks.
     /// Fail-closed: returns error on store failure or when durable sync is required but unavailable.
-    pub async fn sync_revocations_from_store(&mut self) -> Result<usize, String> {
+    pub async fn sync_revocations_from_store(&self) -> Result<usize, String> {
         if !self.config.runtime_hooks.sync_revocations_from_store {
             return Ok(0);
         }
@@ -470,9 +491,15 @@ impl AppState {
         }
         let ids = self.load_revoked_token_ids_from_store().await?;
         let mut added = 0usize;
+        let mut synced = self
+            .synced_revocations
+            .lock()
+            .expect("synced revocations lock");
         for id in ids {
-            if !self.config.revoked_token_ids.iter().any(|x| x == &id) {
-                self.config.revoked_token_ids.push(id);
+            if !self.config.revoked_token_ids.iter().any(|x| x == &id)
+                && !synced.iter().any(|x| x == &id)
+            {
+                synced.push(id);
                 added += 1;
             }
         }
@@ -535,7 +562,7 @@ impl AppState {
     /// Rehydrate pending approvals from durable store into in-memory approval queue.
     /// Restart-safe helper; idempotent for already-present approvals.
     /// Fail-closed when approval-store hook is enabled but store is unavailable.
-    pub async fn rehydrate_pending_approvals_from_store(&mut self) -> Result<usize, String> {
+    pub async fn rehydrate_pending_approvals_from_store(&self) -> Result<usize, String> {
         let Some(store) = &self.store else {
             if self.config.runtime_hooks.use_approval_store {
                 return Err("approval store hook requires store (fail-closed)".into());
@@ -550,6 +577,7 @@ impl AppState {
             .await
             .map_err(|e| format!("approval rehydration query failed (fail-closed): {e}"))?;
         let mut restored = 0usize;
+        let mut approvals = self.approvals.lock().expect("approvals lock");
         for rec in pending {
             let req = ApprovalRequest {
                 id: rec.id.clone(),
@@ -563,7 +591,7 @@ impl AppState {
             } else {
                 Some(rec.args_hash.clone())
             };
-            match self.approvals.create_with_binding(req, None, args_hash) {
+            match approvals.create_with_binding(req, None, args_hash) {
                 Ok(()) => restored += 1,
                 Err(broker::BrokerError::DuplicateApproval(_)) => {}
                 Err(e) => {
@@ -583,7 +611,7 @@ impl AppState {
     /// Config-drift semantics: restored counters are applied as-is; current configured limits are
     /// enforced on subsequent checks. If limits changed across restart, restored counts may be
     /// evaluated against the new limits (intentional, fail-closed toward enforcement).
-    pub async fn load_rate_limit_snapshot_from_store(&mut self) -> Result<bool, String> {
+    pub async fn load_rate_limit_snapshot_from_store(&self) -> Result<bool, String> {
         if !self.config.runtime_hooks.enable_rate_limit_state
             || !self.config.runtime_hooks.persist_rate_limit_state
         {
@@ -604,11 +632,13 @@ impl AppState {
                 format!("rate limit snapshot deserialize failed (fail-closed): {e}")
             })?;
         self.configure_rate_limit_state();
-        let Some(tracker) = self.rate_tracker.as_mut() else {
+        let mut rt = self.rate_tracker.lock().expect("rate tracker lock");
+        let Some(tracker) = rt.as_mut() else {
             return Ok(false);
         };
         tracker.restore_snapshot(snapshot);
-        self.rate_limit_snapshot_dirty = false;
+        self.rate_limit_snapshot_dirty
+            .store(false, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -616,21 +646,25 @@ impl AppState {
     /// Fail-closed on serialize/store errors when persistence is enabled with a store.
     /// shortcut: writes a full global snapshot (no batching/checkpoint); callers that need lower
     /// overhead should batch at a higher layer while preserving fail-closed semantics.
-    pub async fn persist_rate_limit_snapshot_to_store(&mut self) -> Result<bool, String> {
+    pub async fn persist_rate_limit_snapshot_to_store(&self) -> Result<bool, String> {
         if !self.config.runtime_hooks.enable_rate_limit_state
             || !self.config.runtime_hooks.persist_rate_limit_state
         {
-            self.rate_limit_snapshot_dirty = false;
+            self.rate_limit_snapshot_dirty
+                .store(false, Ordering::Relaxed);
             return Ok(false);
         }
         let Some(store) = self.store.clone() else {
             return Ok(false);
         };
-        let Some(tracker) = &self.rate_tracker else {
-            return Ok(false);
+        let snapshot_json = {
+            let rt = self.rate_tracker.lock().expect("rate tracker lock");
+            let Some(tracker) = rt.as_ref() else {
+                return Ok(false);
+            };
+            serde_json::to_string(&tracker.snapshot())
+                .map_err(|e| format!("rate limit snapshot serialize failed (fail-closed): {e}"))?
         };
-        let snapshot_json = serde_json::to_string(&tracker.snapshot())
-            .map_err(|e| format!("rate limit snapshot serialize failed (fail-closed): {e}"))?;
         let updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis().to_string())
@@ -643,14 +677,15 @@ impl AppState {
             .save_rate_limit_snapshot(rec)
             .await
             .map_err(|e| format!("rate limit snapshot save failed (fail-closed): {e}"))?;
-        self.rate_limit_snapshot_dirty = false;
+        self.rate_limit_snapshot_dirty
+            .store(false, Ordering::Relaxed);
         Ok(true)
     }
 
     /// Persist rate/budget snapshot only when in-memory counters changed since last persist.
     /// This is the explicit async helper for sync handle paths that cannot await persistence.
-    pub async fn persist_rate_limit_snapshot_if_dirty(&mut self) -> Result<bool, String> {
-        if !self.rate_limit_snapshot_dirty {
+    pub async fn persist_rate_limit_snapshot_if_dirty(&self) -> Result<bool, String> {
+        if !self.rate_limit_snapshot_dirty.load(Ordering::Relaxed) {
             return Ok(false);
         }
         self.persist_rate_limit_snapshot_to_store().await
@@ -658,7 +693,7 @@ impl AppState {
 
     /// Apply configured durable hooks before handling (sync-revocations/rate-limit/approval state).
     /// Fail-closed on store sync/rehydration errors when hooks require durable state.
-    pub async fn prepare_runtime_hooks(&mut self) -> Result<(), String> {
+    pub async fn prepare_runtime_hooks(&self) -> Result<(), String> {
         self.configure_rate_limit_state();
         if self.config.runtime_hooks.sync_revocations_from_store && self.store.is_none() {
             return Err("revocation sync hook requires store (fail-closed)".into());
@@ -736,9 +771,9 @@ impl AppState {
     }
 
     /// Configure MCP pool runtime from config. Fail-closed: invalid/missing upstream config leaves mcp disabled.
-    pub fn configure_mcp_runtime(&mut self) {
+    pub fn configure_mcp_runtime(&self) {
         if self.config.mcp_upstreams.is_empty() {
-            self.mcp = None;
+            *self.mcp.try_lock().expect("startup mcp lock") = None;
             return;
         }
         let mut pool = McpPool::default();
@@ -761,12 +796,12 @@ impl AppState {
         let selected = match default_upstream.clone() {
             Some(id) if pool.server_config(&id).is_some() => id,
             _ => {
-                self.mcp = None;
+                *self.mcp.try_lock().expect("startup mcp lock") = None;
                 return;
             }
         };
         // Keep runtime available for registered upstreams (dispatch remains fail-closed if unavailable).
-        self.mcp = Some(McpRuntime {
+        *self.mcp.try_lock().expect("startup mcp lock") = Some(McpRuntime {
             pool,
             sessions,
             default_upstream: Some(selected),
@@ -775,13 +810,15 @@ impl AppState {
 
     /// Dispatch an MCP call through pool→upstream abstraction with live stdio session forwarding.
     /// Fail-closed on unavailable/connect/dispatch errors; preserves pool health/metrics hooks.
-    pub fn dispatch_mcp_via_pool(
-        &mut self,
+    /// Uses internal MCP runtime lock so concurrent MCP requests do not serialize on global AppState.
+    pub async fn dispatch_mcp_via_pool(
+        &self,
         method: &str,
         payload: String,
         upstream: Option<&str>,
     ) -> Result<String, String> {
-        let Some(rt) = self.mcp.as_mut() else {
+        let mut mcp = self.mcp.lock().await;
+        let Some(rt) = mcp.as_mut() else {
             // If no upstream configured, allow local placeholder dispatch behavior via pool-less path caller.
             return Err("mcp_pool_unavailable".into());
         };
@@ -833,40 +870,48 @@ impl AppState {
     ///
     /// Note: sync path; rate/budget counter mutations are not durably persisted here.
     /// Use `handle_and_persist_audit` or `persist_rate_limit_snapshot_if_dirty` for restart safety.
-    pub fn handle(&mut self, req: &InboundRequest) -> GatewayOutcome {
+    pub fn handle(&self, req: &InboundRequest) -> GatewayOutcome {
         let (out, _audit_log) = self.handle_with_audit_log(req);
         out
     }
 
-    /// Execute request lifecycle and return the in-memory audit log for durable/store-backed hooks.
-    /// Preserves existing lifecycle behavior and fail-closed semantics.
-    ///
-    /// Note: mutates in-memory rate/budget counters but cannot persist them (sync path). For
-    /// durable restart safety, prefer `handle_and_persist_audit` or call
-    /// `persist_rate_limit_snapshot_if_dirty` after this method in async contexts.
-    pub fn handle_with_audit_log(
-        &mut self,
-        req: &InboundRequest,
-    ) -> (GatewayOutcome, Vec<AuditEntry>) {
-        let rate_mut_before = self.rate_tracker.as_ref().map(|t| t.mutation_count());
-        let (out, audit_log) = match self.rate_tracker.as_mut() {
-            Some(tracker) => handle_request_with_hooks_and_log(
-                req,
-                &self.config,
-                &mut self.approvals,
-                Some(tracker),
-            ),
-            None => handle_request_with_hooks_and_log(req, &self.config, &mut self.approvals, None),
-        };
-        if let Some(before) = rate_mut_before {
-            if self
-                .rate_tracker
-                .as_ref()
-                .is_some_and(|t| t.mutation_count() != before)
-            {
-                self.rate_limit_snapshot_dirty = true;
+    fn effective_config_for_lifecycle(&self) -> GatewayConfig {
+        let mut cfg = self.config.clone();
+        if let Ok(synced) = self.synced_revocations.lock() {
+            for id in synced.iter() {
+                if !cfg.revoked_token_ids.iter().any(|x| x == id) {
+                    cfg.revoked_token_ids.push(id.clone());
+                }
             }
         }
+        cfg
+    }
+
+    /// Execute request lifecycle and return the in-memory audit log for durable/store-backed hooks.
+    /// Preserves existing lifecycle behavior and fail-closed semantics.
+    pub fn handle_with_audit_log(&self, req: &InboundRequest) -> (GatewayOutcome, Vec<AuditEntry>) {
+        let cfg = self.effective_config_for_lifecycle();
+        let (out, audit_log) = {
+            let mut approvals = self.approvals.lock().expect("approvals lock");
+            let mut rate_tracker = self.rate_tracker.lock().expect("rate tracker lock");
+            let rate_mut_before = rate_tracker.as_ref().map(|t| t.mutation_count());
+            let (out, audit_log) = match rate_tracker.as_mut() {
+                Some(tracker) => {
+                    handle_request_with_hooks_and_log(req, &cfg, &mut approvals, Some(tracker))
+                }
+                None => handle_request_with_hooks_and_log(req, &cfg, &mut approvals, None),
+            };
+            if let Some(before) = rate_mut_before {
+                if rate_tracker
+                    .as_ref()
+                    .is_some_and(|t| t.mutation_count() != before)
+                {
+                    self.rate_limit_snapshot_dirty
+                        .store(true, Ordering::Relaxed);
+                }
+            }
+            (out, audit_log)
+        };
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         if out.allowed {
             self.metrics
@@ -891,7 +936,7 @@ impl AppState {
     /// Execute lifecycle and enforce durable audit append-before-return when configured.
     /// Fail-closed: persistence errors or missing durable audit store deny the outcome.
     pub async fn handle_and_persist_audit(
-        &mut self,
+        &self,
         req: &InboundRequest,
     ) -> (GatewayOutcome, Vec<AuditEntry>) {
         let persist_required = self.config.runtime_hooks.persist_audit_events;
@@ -932,7 +977,7 @@ impl AppState {
                 return (audit_persistence_denied(&audit_log, e), audit_log);
             }
         }
-        if self.rate_limit_snapshot_dirty {
+        if self.rate_limit_snapshot_dirty.load(Ordering::Relaxed) {
             if let Err(e) = self.persist_rate_limit_snapshot_if_dirty().await {
                 if out.allowed {
                     self.metrics
@@ -1016,7 +1061,7 @@ mod tests {
 
     #[test]
     fn handle_preserves_fail_closed_denials_and_metrics() {
-        let mut state = AppState::fail_closed();
+        let state = AppState::fail_closed();
         let req = base_req(); // no permit rules => policy deny/fail-closed
         let out = state.handle(&req);
         assert!(!out.allowed);
@@ -1086,8 +1131,9 @@ mod tests {
         let added = state.sync_revocations_from_store().await.unwrap();
         assert_eq!(added, 1);
         assert!(state
-            .config
-            .revoked_token_ids
+            .effective_revoked_token_ids()
+            .await
+            .unwrap()
             .iter()
             .any(|s| s == "rev-state-1"));
 
@@ -1190,16 +1236,26 @@ mod tests {
         let mut state = AppState::fail_closed().with_store(store);
         state.config.runtime_hooks.use_approval_store = true;
         state.prepare_runtime_hooks().await.unwrap();
-        assert!(state.approvals.get("ap-1").is_some());
+        assert!(state
+            .approvals
+            .lock()
+            .expect("approvals lock")
+            .get("ap-1")
+            .is_some());
 
         // idempotent sync
         state.prepare_runtime_hooks().await.unwrap();
-        assert!(state.approvals.get("ap-1").is_some());
+        assert!(state
+            .approvals
+            .lock()
+            .expect("approvals lock")
+            .get("ap-1")
+            .is_some());
     }
 
     #[tokio::test]
     async fn rehydrate_pending_approvals_is_restart_safe_without_store() {
-        let mut state = AppState::fail_closed();
+        let state = AppState::fail_closed();
         let restored = state
             .rehydrate_pending_approvals_from_store()
             .await
@@ -1253,8 +1309,8 @@ for line in sys.stdin:
         vec!["-u".into(), "-c".into(), script.into()]
     }
 
-    #[test]
-    fn configure_mcp_runtime_dispatches_stdio_initialize_list_and_call() {
+    #[tokio::test]
+    async fn configure_mcp_runtime_dispatches_stdio_initialize_list_and_call() {
         let mut state = AppState::fail_closed();
         let server = mcp_pool::UpstreamServerConfig::with_stdio(
             "fake",
@@ -1268,7 +1324,8 @@ for line in sys.stdin:
         state.config.mcp_default_upstream = Some("fake".into());
 
         state.configure_mcp_runtime();
-        let rt = state.mcp.as_ref().expect("mcp runtime configured");
+        let rt_guard = state.mcp.lock().await;
+        let rt = rt_guard.as_ref().expect("mcp runtime configured");
         assert_eq!(
             rt.pool.state(&UpstreamId("fake".into())),
             Some(mcp_pool::ConnectionState::Connected)
@@ -1277,6 +1334,7 @@ for line in sys.stdin:
             .sessions
             .get(&UpstreamId("fake".into()))
             .is_some_and(|s| s.is_ready()));
+        drop(rt_guard);
 
         // Non-envelope params form should still dispatch to initialize (forward normalization path).
         let init_obj = state
@@ -1285,6 +1343,7 @@ for line in sys.stdin:
                 r#"{"protocolVersion":"2024-11-05","capabilities":{}}"#.to_string(),
                 None,
             )
+            .await
             .expect("initialize via params normalization");
         assert!(init_obj.contains("protocolVersion"), "init_obj={init_obj}");
 
@@ -1307,13 +1366,14 @@ for line in sys.stdin:
         ] {
             let out = state
                 .dispatch_mcp_via_pool(method, payload.to_string(), None)
+                .await
                 .expect(method);
             assert!(out.contains(needle), "method={method} out={out}");
         }
     }
 
-    #[test]
-    fn configure_mcp_runtime_fail_closed_on_stdio_connect_error() {
+    #[tokio::test]
+    async fn configure_mcp_runtime_fail_closed_on_stdio_connect_error() {
         let mut state = AppState::fail_closed();
         let server = mcp_pool::UpstreamServerConfig::with_stdio(
             "bad",
@@ -1333,19 +1393,21 @@ for line in sys.stdin:
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
                 None,
             )
+            .await
             .expect_err("dispatch must fail closed when stdio connect unavailable");
         assert!(err.contains("pool_dispatch_failed"), "{err}");
     }
 
-    #[test]
-    fn dispatch_mcp_via_pool_fails_closed_without_runtime() {
-        let mut state = AppState::fail_closed();
+    #[tokio::test]
+    async fn dispatch_mcp_via_pool_fails_closed_without_runtime() {
+        let state = AppState::fail_closed();
         let err = state
             .dispatch_mcp_via_pool(
                 "initialize",
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
                 None,
             )
+            .await
             .expect_err("no runtime");
         assert_eq!(err, "mcp_pool_unavailable");
     }
@@ -1392,11 +1454,13 @@ for line in sys.stdin:
         state2.config.rate_limits.per_token_call_limit = Some(2);
         state2.prepare_runtime_hooks().await.unwrap();
 
-        let tracker = state2.rate_tracker.as_ref().expect("tracker restored");
-        assert_eq!(
-            tracker.token_total_calls(&base_req().token.revocation_id.0),
-            1
-        );
+        let count = {
+            let g = state2.rate_tracker.lock().expect("rate tracker lock");
+            g.as_ref()
+                .expect("tracker restored")
+                .token_total_calls(&base_req().token.revocation_id.0)
+        };
+        assert_eq!(count, 1);
 
         let (out2, _) = state2.handle_and_persist_audit(&base_req()).await;
         assert!(out2.allowed, "second call after restart should be allowed");
@@ -1469,7 +1533,9 @@ for line in sys.stdin:
         let (out, _) = state.handle_with_audit_log(&base_req());
         assert!(out.allowed);
         assert!(
-            state.rate_limit_snapshot_dirty,
+            state
+                .rate_limit_snapshot_dirty
+                .load(std::sync::atomic::Ordering::Relaxed),
             "sync handle should mark rate snapshot dirty"
         );
         let persisted = state.persist_rate_limit_snapshot_if_dirty().await.unwrap();
@@ -1486,15 +1552,16 @@ for line in sys.stdin:
         restarted.config.runtime_hooks.persist_rate_limit_state = true;
         restarted.config.rate_limits.per_token_call_limit = Some(2);
         restarted.prepare_runtime_hooks().await.unwrap();
-        let tracker = restarted.rate_tracker.as_ref().expect("tracker restored");
+        let tracker = restarted.rate_tracker.lock().expect("rate tracker lock");
+        let tracker = tracker.as_ref().expect("tracker restored");
         assert_eq!(
             tracker.token_total_calls(&base_req().token.revocation_id.0),
             1
         );
     }
 
-    #[test]
-    fn dispatch_mcp_stdio_decode_failure_is_fail_closed_and_clears_session() {
+    #[tokio::test]
+    async fn dispatch_mcp_stdio_decode_failure_is_fail_closed_and_clears_session() {
         let mut state = AppState::fail_closed();
         let script = r#"
 import sys
@@ -1524,10 +1591,12 @@ except Exception:
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
                 None,
             )
+            .await
             .expect_err("decode failure must fail closed");
         assert!(err.contains("pool_dispatch_failed"), "{err}");
 
-        let rt = state.mcp.as_ref().expect("runtime present");
+        let rt = state.mcp.lock().await;
+        let rt = rt.as_ref().expect("runtime present");
         assert!(
             !rt.sessions.contains_key(&UpstreamId("badjson".into())),
             "corrupt session must be removed for reconnect-on-next-call"
@@ -1538,8 +1607,8 @@ except Exception:
         );
     }
 
-    #[test]
-    fn dispatch_mcp_stdio_closed_upstream_is_fail_closed_and_clears_session() {
+    #[tokio::test]
+    async fn dispatch_mcp_stdio_closed_upstream_is_fail_closed_and_clears_session() {
         let mut state = AppState::fail_closed();
         let script = r#"
 import sys
@@ -1564,10 +1633,12 @@ sys.stdin.readline()
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
                 None,
             )
+            .await
             .expect_err("closed upstream must fail closed");
         assert!(err.contains("pool_dispatch_failed"), "{err}");
 
-        let rt = state.mcp.as_ref().expect("runtime present");
+        let rt = state.mcp.lock().await;
+        let rt = rt.as_ref().expect("runtime present");
         assert!(
             !rt.sessions.contains_key(&UpstreamId("closed".into())),
             "closed session must be removed"
@@ -1891,13 +1962,15 @@ sys.stdin.readline()
 
         state.prepare_runtime_hooks().await.unwrap();
         {
-            let tracker = state.rate_tracker.as_mut().expect("tracker configured");
+            let mut rt = state.rate_tracker.lock().expect("rate tracker lock");
+            let tracker = rt.as_mut().expect("tracker configured");
             tracker.consume("tok-rt", "tool.echo", 1, 0);
             assert_eq!(tracker.token_total_calls("tok-rt"), 1);
         }
 
         state.prepare_runtime_hooks().await.unwrap();
-        let tracker = state.rate_tracker.as_ref().expect("tracker preserved");
+        let tracker = state.rate_tracker.lock().expect("rate tracker lock");
+        let tracker = tracker.as_ref().expect("tracker preserved");
         assert_eq!(
             tracker.token_total_calls("tok-rt"),
             1,

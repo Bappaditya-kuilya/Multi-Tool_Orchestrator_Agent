@@ -203,7 +203,7 @@ fn parse_raw(req: &McpRequest) -> Result<Value, McpResponse> {
 }
 
 async fn append_mcp_audit(
-    state: &mut AppState,
+    state: &AppState,
     task_id: Option<String>,
     tool: &str,
     decision: &str,
@@ -737,25 +737,27 @@ async fn validate_token_auth(
 }
 
 async fn apply_rate_tracker(
-    state: &mut AppState,
+    state: &AppState,
     token_key: &str,
     action: &str,
     now: u64,
     units: u64,
 ) -> Result<(), String> {
     state.configure_rate_limit_state();
-    let rate_mut_before = state.rate_tracker.as_ref().map(|t| t.mutation_count());
-    let decision = {
-        let Some(tracker) = state.rate_tracker.as_mut() else {
+    let (decision, mutated) = {
+        let mut rt = state.rate_tracker.lock().expect("rate tracker lock");
+        let Some(tracker) = rt.as_mut() else {
             return Ok(());
         };
-        tracker.consume(token_key, action, now, units)
+        let before = tracker.mutation_count();
+        let decision = tracker.consume(token_key, action, now, units);
+        let mutated = tracker.mutation_count() != before;
+        (decision, mutated)
     };
-    let mutated = rate_mut_before
-        .zip(state.rate_tracker.as_ref().map(|t| t.mutation_count()))
-        .is_some_and(|(b, a)| a != b);
     if mutated {
-        state.rate_limit_snapshot_dirty = true;
+        state
+            .rate_limit_snapshot_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if state.config.runtime_hooks.enable_rate_limit_state
             && state.config.runtime_hooks.persist_rate_limit_state
             && state.store.is_some()
@@ -924,7 +926,7 @@ async fn dispatch_stdio_upstream(
 }
 
 async fn _dispatch_upstream_request(
-    state: &mut AppState,
+    state: &AppState,
     payload_json: String,
     req_upstream: Option<&str>,
 ) -> Result<String, String> {
@@ -932,11 +934,13 @@ async fn _dispatch_upstream_request(
     if stdio_transport_for_request(state, req_upstream).is_some() {
         return dispatch_stdio_upstream(state, &payload_json, req_upstream).await;
     }
-    state.dispatch_mcp_via_pool("tools/call", payload_json, req_upstream)
+    state
+        .dispatch_mcp_via_pool("tools/call", payload_json, req_upstream)
+        .await
 }
 
 async fn dispatch_upstream_method(
-    state: &mut AppState,
+    state: &AppState,
     method: &str,
     payload_json: String,
     req_upstream: Option<&str>,
@@ -944,17 +948,19 @@ async fn dispatch_upstream_method(
     if stdio_transport_for_request(state, req_upstream).is_some() {
         return dispatch_stdio_upstream(state, &payload_json, req_upstream).await;
     }
-    state.dispatch_mcp_via_pool(method, payload_json, req_upstream)
+    state
+        .dispatch_mcp_via_pool(method, payload_json, req_upstream)
+        .await
 }
 
 /// Dispatch MCP JSON-RPC through gateway front logic + pool/upstream abstractions with store-backed controls.
-pub async fn handle_mcp_request_async(state: &mut AppState, req: McpRequest) -> McpResponse {
+pub async fn handle_mcp_request_async(state: &AppState, req: McpRequest) -> McpResponse {
     handle_mcp_request_async_with_context(state, req, McpHttpContext::default()).await
 }
 
 /// Dispatch MCP JSON-RPC with HTTP/auth context (token/auth, policy, approval, taint/rate hooks, audit).
 pub async fn handle_mcp_request_async_with_context(
-    state: &mut AppState,
+    state: &AppState,
     req: McpRequest,
     ctx: McpHttpContext,
 ) -> McpResponse {
@@ -1536,7 +1542,7 @@ pub async fn handle_mcp_request_async_with_context(
             // Preserve local capability surface when no upstream; proxy to upstream when configured.
             let upstream_available = stdio_transport_for_request(state, req.upstream.as_deref())
                 .is_some()
-                || state.mcp.is_some();
+                || state.has_mcp_runtime().await;
             if upstream_available {
                 emit(
                     state,
@@ -1625,7 +1631,7 @@ pub async fn handle_mcp_request_async_with_context(
                     json!({"content":[{"type":"text","text":"ok"}],"isError": false, "structuredContent":{"ok":true,"dispatch":"gateway+pool-abstraction"}}),
                 )
             } else if stdio_transport_for_request(state, req.upstream.as_deref()).is_some()
-                || state.mcp.is_some()
+                || state.has_mcp_runtime().await
             {
                 emit(
                     state,
@@ -1650,7 +1656,7 @@ pub async fn handle_mcp_request_async_with_context(
         }
         _ => {
             if stdio_transport_for_request(state, req.upstream.as_deref()).is_some()
-                || state.mcp.is_some()
+                || state.has_mcp_runtime().await
             {
                 emit(state, "mcp.upstream.dispatch", &method, task_id.clone());
                 match dispatch_upstream_method(
@@ -1865,7 +1871,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -1903,7 +1909,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert!(v["error"]["message"]
@@ -1955,7 +1961,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert!(v["error"]["message"]
@@ -1976,7 +1982,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, bad_params).await;
+        let resp = handle_mcp_request_async(&state, bad_params).await;
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32602);
 
@@ -1986,7 +1992,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, unknown).await;
+        let resp = handle_mcp_request_async(&state, unknown).await;
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32601);
         assert_eq!(v["error"]["message"], "Method not found");
@@ -2030,7 +2036,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.ok, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["result"]["structuredContent"]["ok"], true);
@@ -2038,7 +2044,7 @@ mod tests {
 
     #[tokio::test]
     async fn emits_denied_event_for_policy_failures() {
-        let mut state = state_with_store(); // default config fail-closed, no permit rules
+        let state = state_with_store(); // default config fail-closed, no permit rules
         let mut rx = state.events_tx.subscribe();
         let req = McpRequest {
             method: String::new(),
@@ -2049,7 +2055,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let events: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
@@ -2081,7 +2087,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2107,7 +2113,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert!(v["error"]["message"]
@@ -2133,7 +2139,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2158,7 +2164,7 @@ mod tests {
             upstream: None,
         };
         let resp = handle_mcp_request_async_with_context(
-            &mut state,
+            &state,
             req,
             McpHttpContext {
                 authorization: Some("Bearer test-token".into()),
@@ -2206,7 +2212,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxies_stdio_upstream_initialize_tools_list_and_demo_echo_end_to_end() {
-        let mut state = demo_stdio_state();
+        let state = demo_stdio_state();
 
         let init = McpRequest {
             method: String::new(),
@@ -2216,7 +2222,7 @@ mod tests {
             }).to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, init).await;
+        let resp = handle_mcp_request_async(&state, init).await;
         assert!(resp.ok, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(
@@ -2230,7 +2236,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, list).await;
+        let resp = handle_mcp_request_async(&state, list).await;
         assert!(resp.ok, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert!(v["result"]["tools"]
@@ -2248,7 +2254,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, call).await;
+        let resp = handle_mcp_request_async(&state, call).await;
         assert!(resp.ok, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["result"]["structuredContent"]["echo"]["message"], "hi-s1");
@@ -2270,7 +2276,7 @@ mod tests {
 
     #[tokio::test]
     async fn denies_demo_forbidden_tool_call_by_policy_fail_closed() {
-        let mut state = demo_stdio_state(); // configured upstream + permit-all baseline
+        let state = demo_stdio_state(); // configured upstream + permit-all baseline
         let req = McpRequest {
             method: String::new(),
             payload_json: json!({
@@ -2280,7 +2286,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2310,13 +2316,13 @@ mod tests {
 
     #[tokio::test]
     async fn parse_error_returns_jsonrpc_safe_fail_closed_response() {
-        let mut state = state_with_store();
+        let state = state_with_store();
         let req = McpRequest {
             method: String::new(),
             payload_json: "{not-json".into(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
@@ -2356,7 +2362,7 @@ mod tests {
                 .to_string(),
                 upstream: None,
             };
-            let resp = handle_mcp_request_async(&mut state, req).await;
+            let resp = handle_mcp_request_async(&state, req).await;
             assert!(resp.fail_closed, "{}", resp.payload_json);
             let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
             assert_eq!(v["error"]["code"], -32003);
@@ -2386,7 +2392,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2423,7 +2429,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2574,7 +2580,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32000);
@@ -2606,7 +2612,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         // audit append-before-return takes precedence for durable fail-closed behavior
@@ -2659,13 +2665,13 @@ mod tests {
 
         let mut state1 = AppState::fail_closed().with_store(store.clone());
         state1.config = permit_all_config();
-        let resp1 = handle_mcp_request_async(&mut state1, req()).await;
+        let resp1 = handle_mcp_request_async(&state1, req()).await;
         assert!(resp1.ok, "{}", resp1.payload_json);
 
         // Simulate restart: fresh AppState against same durable store.
         let mut state2 = AppState::fail_closed().with_store(store.clone());
         state2.config = permit_all_config();
-        let resp2 = handle_mcp_request_async(&mut state2, req()).await;
+        let resp2 = handle_mcp_request_async(&state2, req()).await;
         assert!(resp2.ok, "{}", resp2.payload_json);
 
         let events = store
@@ -2719,7 +2725,7 @@ mod tests {
         let mut state = AppState::fail_closed().with_store(store);
         state.config = permit_all_config();
         state.config.runtime_hooks.sync_revocations_from_store = true;
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2743,7 +2749,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, first).await;
+        let resp = handle_mcp_request_async(&state, first).await;
         assert!(resp.ok, "{}", resp.payload_json);
         assert!(!resp.fail_closed, "{}", resp.payload_json);
 
@@ -2760,7 +2766,7 @@ mod tests {
             .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, second).await;
+        let resp = handle_mcp_request_async(&state, second).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -2907,7 +2913,7 @@ mod tests {
             payload_json: json!({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"gateway.health"}}).to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32002);
@@ -2959,7 +2965,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.ok, "{}", resp.payload_json);
         let store = state.store.as_ref().unwrap();
         let pin = store
@@ -2996,7 +3002,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         assert_eq!(v["error"]["code"], -32003);
@@ -3028,7 +3034,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         let msg = v["error"]["message"].as_str().unwrap_or("");
@@ -3171,7 +3177,7 @@ mod tests {
                 .to_string(),
             upstream: None,
         };
-        let resp = handle_mcp_request_async(&mut state, req).await;
+        let resp = handle_mcp_request_async(&state, req).await;
         assert!(resp.fail_closed, "{}", resp.payload_json);
         let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
         let msg = v["error"]["message"].as_str().unwrap_or("");
@@ -3208,8 +3214,8 @@ mod tests {
             upstream: None,
         };
 
-        let resp_a = handle_mcp_request_async(&mut state, mk(101, "task-a")).await;
-        let resp_b = handle_mcp_request_async(&mut state, mk(202, "task-b")).await;
+        let resp_a = handle_mcp_request_async(&state, mk(101, "task-a")).await;
+        let resp_b = handle_mcp_request_async(&state, mk(202, "task-b")).await;
 
         for (resp, expected_id, expected_task) in
             [(&resp_a, 101i64, "task-a"), (&resp_b, 202i64, "task-b")]
@@ -3306,8 +3312,8 @@ mod tests {
             upstream: None,
         };
 
-        let resp_a = handle_mcp_request_async(&mut state, req_a).await;
-        let resp_b = handle_mcp_request_async(&mut state, req_b).await;
+        let resp_a = handle_mcp_request_async(&state, req_a).await;
+        let resp_b = handle_mcp_request_async(&state, req_b).await;
 
         let va: Value = serde_json::from_str(&resp_a.payload_json).unwrap();
         assert!(resp_a.ok, "{}", resp_a.payload_json);

@@ -7,13 +7,13 @@
 - `cargo fmt --all --check`: **pass**
 - `cargo clippy --all-targets --all-features -- -D warnings`: **pass**
 - `cargo test --all`: **pass**
-- Bench: **38 passed, 7 xfailed** (capture mode, commit, env, full logs)
+- Bench: unconfigured baseline **38 passed, 7 xfailed**; configured local sqlite+stdio demo clean-gateway/data-dir capture **44 passed, 1 xfailed** (3 capability tests env-gated in unconfigured runs; same-instance rerun stateful contamination caveat; not enforce-mode sign-off). Capture mode, commit, env, full logs.
 - Dashboard: **build pass**
 
 ## Current reality (do not overstate)
 
 - Runtime is partial: core primitives and gateway axum HTTP/MCP-dispatch scaffolding exist (in-memory store wiring by default), but production enforcement is incomplete.
-- Bench results are promising (**38 passed, 7 xfailed**) but not yet enforce-mode/live enforcement proof against a fully wired, production-shaped gateway.
+- Bench results: unconfigured baseline **38 passed, 7 xfailed**; configured local sqlite+stdio demo clean-gateway/data-dir capture **44 passed, 1 xfailed** (env-gated capability tests pass when configured; same-instance rerun stateful contamination caveat). Not enforce-mode/live enforcement proof against a fully wired, production-shaped gateway.
 - Audit chain primitives exist (`crates/core`, in-memory wiring) with **non-cryptographic FNV-1a** hashing; no cryptographic/durable append-before-return or persisted runtime `audit verify`.
 - Real deps/integrations remain blocked/incomplete: Biscuit, Cedar, full `rmcp` runtime/upstream execution, SQLx durable stores, secret adapters/broker guarantees, approvals persistence, and hardened M6 rate-limit/taint/observability enforcement. No live hosted demo, no S2 validation, no v0.1.0 sign-off.
 

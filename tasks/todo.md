@@ -30,6 +30,12 @@
 ## Phase 2C (in progress)
 - [x] T1 Live evidence bundle: configured clean gateway bench 44p/1x, targeted 3 capability tests 3p; stateful contamination caveat captured; docs updated. Evidence: e2e/logs/phase2c-live-bench-20261121T160243Z/.
 - [x] T2 Rate/budget snapshot hardening: persist_rate_limit_state knob, dirty persist, sync API/MCP persist coverage, config-drift tests/docs.
-- [ ] T3 Concurrent cross-task isolation (high risk).
-- [ ] T4 Audit fail-closed/crypto proof across paths.
-- [ ] T5 Docs/release readiness sync for checkpoint C.
+- [x] T3 Concurrent cross-task isolation: global AppState mutex removed; per-subsystem locks; concurrent router integration test (20 mixed requests) passes. Bench confused-deputy still xfail (live concurrent harness not wired). (owner: T3/gateway+mcp crates)
+- [~] T4 Audit fail-closed/crypto proof across paths. Docs/evidence gaps narrowed (caveats/claims synced, evidence index clarified); no audit-failure injection e2e script added (no crate/config hook found without gateway source changes). Durable append-before-return across all runtime paths + crypto audit/signing remain unproven.
+- [~] T5 Docs/release readiness sync for checkpoint C. Owned docs/evidence/scripts updated factually; stale 38p/7xf claims remain in non-owned docs (README.md, docs/runbook.md, docs/MIGRATION_MAP.md, docs/threat-model.md) - report to T3/human.
+
+## Checkpoint C status (factual snapshot, 2026-11-21)
+- Configured clean-gateway/data-dir bench capture: **44 passed, 1 xfailed** (`e2e/logs/phase2c-live-bench-20261121T160243Z/`); 3 named capability tests pass when configured but remain env-gated in unconfigured runs. Same-instance rerun showed stateful contamination (injection-exfil seed approval-required fail-closed); canonical results are clean captures only. Not enforce-mode sign-off/release bundle.
+- Rate/budget snapshot hardening done with documented caveats (full global snapshot per dirty persist, no integrity signing, config-drift as-is).
+- Cross-task isolation still **not concurrently proven** (global `AppState` mutex serialization); confused-deputy capability xfail remains.
+- Audit fail-closed/crypto proof still incomplete across all runtime paths; no crate source edits made in this sync.
