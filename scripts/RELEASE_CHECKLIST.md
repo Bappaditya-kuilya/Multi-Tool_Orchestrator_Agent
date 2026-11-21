@@ -5,7 +5,7 @@
 ## Latest reported snapshot (current verified green baseline, not a sign-off)
 
 - `cargo fmt --all --check`: **pass**
-- `cargo clippy --all-targets -- -D warnings`: **pass**
+- `cargo clippy --all-targets --all-features -- -D warnings`: **pass**
 - `cargo test --all`: **pass**
 - Bench: **38 passed, 7 xfailed** (capture mode, commit, env, full logs)
 - Dashboard: **build pass**
@@ -20,13 +20,14 @@
 ## Evidence to capture before release claims
 
 - Toolchain/environment: OS, Rust version (`rust-toolchain.toml`), Python/Node versions, commit SHA.
-- Commands and outcomes: `cargo fmt/clippy/check/test`, bench mode/results and xfail reasons, dashboard build, e2e/demo run logs (`e2e/logs/*`).
-- Audit integrity proof on persisted data (when available): export + verify, seq/hash continuity.
+- Commands and outcomes: `cargo fmt/clippy/check/test`, bench mode/results and xfail reasons, dashboard build, and e2e/demo logs/artifacts (`e2e/logs/*`).
+- S1/live-gateway evidence (when runnable): `./e2e/capture_live_evidence.sh` (or managed `./e2e/demo_flow.sh` with `E2E_SQLITE=1 E2E_API_FLOW=1 E2E_MCP_FLOW=1 E2E_BENCH_LIVE=1 E2E_BENCH_MODES=all`) capturing sqlite gateway flow, tasks/approvals/audit query+verify/MCP checks, runtime audit verify probe, and per-mode bench artifacts (`baseline|dryrun|enforce`) with `evidence-manifest.json`.
+- Audit integrity proof on persisted data (when available): export + verify, seq/hash continuity (runtime `GET /v1/audit/verify` probes are best-effort endpoint evidence, not complete persisted proof).
 - Operational drills (when available): S1 backup/restore, readiness/fail-closed behavior, rollback triggers.
 
 ## Suggested release gate sequence (when runtime ready)
 
-1. Keep fmt/clippy/check/test green in CI and capture reproducible logs/artifacts.
+1. Keep fmt/clippy/check/test green in CI (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all`, `cargo test --all`) and capture reproducible logs/artifacts.
 2. Record reproducible bench baseline, then enforce-mode/live enforcement run against a wired gateway with documented pass criteria.
 3. Complete e2e/demo flow (`./e2e/demo_flow.sh`) with durable audit verification artifact when implemented.
 4. Validate ops: `/healthz`, `/readyz`, `/metrics`, tracing/OTel, rate-limit/taint hooks, fail-closed audit/store/policy/token errors, approval timeout-deny behavior.

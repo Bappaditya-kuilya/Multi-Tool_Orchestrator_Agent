@@ -1,0 +1,29 @@
+# FINAL S1 Evidence (fast pass)
+
+Scope: `e2e/logs/**` artifacts reviewed; concise summary of captured S1/restart evidence.
+
+## Key captures
+
+| Artifact path | Status | What it proves |
+| --- | --- | --- |
+| `e2e/logs/proof-s1-source-20261120T194149Z/` | Completed (manifested) | Full live S1 flow. `evidence-manifest.json` (`status: completed`, `api_flow: true`, sqlite WAL). `api_flow/evidence-summary.txt`: `16_mcp_demo_echo_allow_http_code=200` (allow), `17_mcp_demo_forbidden_deny_http_code=403` (deny), `19_mcp_demo_echo_approval_pending_deny_http_code=403` then `21_mcp_demo_echo_approval_approved_allow_http_code=200` (approval gate pending→approved), `10_audit_verify_get_http_code=200` and `23_audit_verify_get_post_actions_http_code=200` / `22_audit_query_get_post_actions_http_code=200` (audit query/verify). `api_flow/23_audit_verify_get_post_actions.json`: `{"ok":true,"checked_events":14,...}`. Detailed per-step req/resp/meta under `api_flow/01_*`–`23_*`. |
+| `e2e/logs/proof-s1-source-restart-20261120T201236Z/` | Completed (manifested, restart-persistence capture) | Pre-restart sqlite+real-stdio S1 flow: allow `demo.echo` 200, deny `demo.forbidden` 403 fail-closed, approval pending deny 403 → approved allow 200, audit query/verify 200 with chain ok (`api_flow/evidence-summary.json`, `api_flow/16,17,19,21,22,23_*`). Restart against same sqlite DB/config: post-restart probes 200 (`api_flow/restart/01..07_*`), audit verify `{"ok":true,"checked_events":8,"first_bad_seq":null}`, audit continuity pre/post count=8 chain_verified=true, prior task present/revoked state continuity (`api_flow/restart/restart-evidence-summary.json`). Bench baseline step 38p/7x and audit-chain unit proxy passed (`run_bench.log`, `verify_audit_chain.log`). `demo_flow.summary.log` records `FAILURES: gateway_help_probe:124` (probe timeout; S1/restart evidence steps completed). |
+| `e2e/logs/smoke-scripts-restart-evidence/` | Completed (manifested) | Restart persistence evidence (`manifest.json`, `kind: sqlite_stdio_live_restart_evidence`, `phases.phase1_live.ok=true`, `phases.phase2_after_restart.ok=true`, sqlite WAL). Both phases show `healthz/readyz/tasks/audit` 200, MCP initialize/tools_list 200, `demo.echo` allow 200, `demo.forbidden` deny 403, and `audit_verify` 200 before/after MCP in phase1 and phase2 (`phase1_*`, `phase2_*` artifacts). Proves restart continuity signals across gateway restart. |
+| `e2e/logs/proof-s1-source-manual2/api_flow/` | Completed API-flow capture (targeted) | Manual S1 proof subset with explicit outcomes. `proof_meta.txt` records `approval_id=appr-proof-1795204154`. Metas/JSON show allow `16_mcp_demo_echo_allow` HTTP 200 (`ok:true`, echo payload), deny `17_mcp_demo_forbidden_deny` HTTP 403 (`fail_closed:true`, "Denied by policy"), approval pending deny `19_mcp_demo_echo_approval_pending_deny` HTTP 403 ("Approval not granted"), approved allow `21_mcp_demo_echo_approval_approved_allow` HTTP 200, audit verify `23_audit_verify_get` HTTP 200 with `{"ok":true,"checked_events":5,...}`. |
+| `e2e/logs/proof-s1-source-manual/api_flow/` | Completed API-flow capture (targeted, earlier) | Similar manual S1 subset: allow/deny/approval create→pending-deny→approve→approved-allow present (`16`–`21`), audit query/verify post-actions present (`22`/`23` JSON+meta). `23_audit_verify_get_post_actions.json`: `{"ok":true,"checked_events":4,...}`. `proof_ids.txt` records approval id; includes `generated-scopegate-live.toml`, `gateway.log/pid`, sqlite DB. |
+| `e2e/logs/manual-live-s1/` | Captured bundle present | Contains `api_flow/`, `bench/`, `evidence-manifest.json`, sqlite DB/WAL/SHM. Indicates a fuller live/manual capture attempt; contents not exhaustively enumerated in this pass. |
+
+## What is proven (by evidence above)
+
+- **Allow:** successful upstream MCP/tool call path (`demo.echo` / allow cases return HTTP 200, `ok:true`).
+- **Deny:** forbidden tool/policy denial path returns HTTP 403 with fail-closed payload (`demo.forbidden`, policy/approval-not-granted cases).
+- **Approval:** pending approval blocks execution (403) and approved approval permits execution (200) in captured flows (`18`–`21` sequences in 194149Z/manual/manual2/201236Z).
+- **Audit verify:** audit chain verification succeeds (`/v1/audit/verify` HTTP 200, `body.ok=true`) including post-action checks in 194149Z/manual/manual2 and pre/post-restart checks in 201236Z and restart-evidence phases.
+- **Restart:** `proof-s1-source-restart-20261120T201236Z` captures restart against same sqlite DB/config with post-restart audit verify ok, audit continuity, and task/revocation state continuity; `smoke-scripts-restart-evidence` provides explicit two-phase pre/post-restart continuity signals (sqlite WAL persistence signals; runtime endpoint evidence).
+
+## Newer/other observed dirs & gaps
+
+- `e2e/logs/proof-s1-source-restart-20261120T195527Z/`: **partial/incomplete** (build/check/demo_flow meta + db files only; no `api_flow/`, no manifest/summary) — cannot by itself prove allow/deny/approval/audit-verify/restart outcomes.
+- `e2e/logs/proof-s1-source-20261121/`, `proof-s1-source-20261121b/`, `proof-s1-source-20261121c/`, `e2e/logs/capture-live-s1/`: setup/build artifacts but **no captured api_flow/restart evidence** in dirs — insufficient alone to prove runtime S1 outcomes.
+- `e2e/logs/smoke-live-s1/`, `e2e/logs/smoke-live-s1b/`: smoke/probe artifacts (gateway/readiness/config), not full S1 proof bundles.
+- This pass is artifact-based (no live reruns). Completeness of uninspected nested files (e.g. full `manual-live-s1/api_flow` details) not fully asserted here. Runtime audit verify remains endpoint/store-reported evidence, not complete persisted/cryptographic proof.

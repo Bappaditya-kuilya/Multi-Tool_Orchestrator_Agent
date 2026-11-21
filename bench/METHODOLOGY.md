@@ -2,11 +2,13 @@
 
 Status: runnable pytest harness for PRD M4 with gateway-independent local models plus gateway-dependent/live integration cases. Provides local enforcement evidence, live-gateway enforcement evidence path (probe/policy/latency checks when endpoint configured), stronger enforce-mode assertions, latency/overhead reporting, and CI artifacts. Collection/execution succeed without a gateway (live cases xfail with explicit reasons when unconfigured).
 
+**Non-live baseline expectation:** `38 passed, 7 xfailed` with explicit gateway-dependent reasons recorded in test output and report artifacts (4 capability-gated cases + 3 live-integration cases when gateway URL not configured).
+
 ## Semantics
-- **pass**: modeled attack/edge case blocked or invariant preserved by local model/enforcement checks.
+- **pass**: modeled attack/edge case blocked or invariant preserved by local model/enforcement checks, or live gateway evidence observed (probe/policy denial/latency) when configured and enforced.
 - **fail/error**: unexpected break (CI gate failure).
-- **xfail**: requires running gateway/policy/taint/credential/audit infrastructure or live endpoint not configured; reasoned, not silent.
-Collection/execution succeed without a gateway. Live cases xfail cleanly when `--gateway-url` / `$SCOPEGATE_GATEWAY_URL` is unset.
+- **xfail**: capability not currently enforced/provable in runtime, or live endpoint not configured/reachable; reasoned, not silent.
+Collection/execution succeed without a gateway. Live cases xfail cleanly when `--gateway-url` / `$SCOPEGATE_GATEWAY_URL` is unset/unreachable as applicable; when a live gateway is configured and reachable, live integration cases may pass while capability-gated cases remain xfailed with precise reasons. Reports/artifacts capture run mode and gateway URL/config/reachability context and list each xfailed case with its reason for evidence traceability.
 
 ## Attack classes (PRD / request mapping)
 
@@ -101,16 +103,17 @@ Markers: `baseline`, `dryrun`, `enforce`, `live` (suite default: `baseline`). Fi
 Also aligned with: `reference/tests/test_security_{confinement,depth,pow,queue,routing,tokens}.py`, `reference/tests/test_auditor.py`.
 
 ## Reporting and CI artifacts
-`report.py` produces CI-style output and README table format:
-- `--format ci` (default): full markdown report (totals, README-table block, per-class/case tables, case-duration + instrumented latency/overhead stats, thresholds).
-- `--format readme-table`: compact markdown table block for README/docs/status comments.
-- `--json`: machine-readable summary/cases, thresholds, latency fields, `instrumented_latency`, and `readme_table_markdown`.
+`report.py` produces CI-style output and README table format with explicit run evidence metadata:
+- `--bench-mode` / `--gateway-url`: record run mode and gateway URL/config context in reports (defaults from env).
+- `--format ci` (default): full markdown report including run context (mode, gateway URL/configured/reachable/probe), totals, README-table block, explicit "XFailed cases (gateway-dependent / live-unconfigured)" reasons, per-class/case tables, case-duration + instrumented latency/overhead stats, and thresholds.
+- `--format readme-table`: compact markdown table block for README/docs/status comments (includes mode/gateway context and xfail reasons when present).
+- `--json`: machine-readable `run_context`, summary/cases, `xfail_cases` with reasons, thresholds, latency fields, `instrumented_latency`, and `readme_table_markdown`.
 - `--md`: writes full CI markdown report to file.
 - `--latency-json`: ingests instrumented latency artifact.
 - Threshold gates: `--max-failures`, `--max-errors`, `--max-xpassed` (default 0), `--min-passed`, `--max-time-s`, `--max-p95-case-ms`, `--max-instrumented-p95-ms`.
 
-CI artifacts helper (`bench/ci_artifacts.sh [mode]`, output `bench/artifacts/`): `bench-junit.xml`, `bench-latency.json`, `bench-summary.json`, `bench-report.md`, `bench-readme-table.md`, `bench-ci-env.json`.
-Live gateway helper (`bench/run_local_gateway.sh [mode]`): runs live-marked checks against a locally started gateway (if configured) and emits artifacts including `bench-live-junit.xml`, `bench-env.json`, latency, summary, and report outputs for enforcement evidence.
+CI artifacts helper (`bench/ci_artifacts.sh [mode]`, output `bench/artifacts/`): `bench-junit.xml`, `bench-latency.json`, `bench-summary.json`, `bench-report.md`, `bench-readme-table.md`, `bench-ci-env.json` (run mode + gateway config/probe context, expected baseline).
+Live gateway helper (`bench/run_local_gateway.sh [mode]`): runs live-marked checks against a locally started gateway (if configured) and emits artifacts including `bench-live-junit.xml`, `bench-env.json`, latency, summary, and report outputs for enforcement evidence with explicit mode/gateway context and xfail reasons.
 
 ## Coverage and porting notes
 - **Local-model (gateway-independent):** scope attenuation/no-inflation/ordering/revocation, benign + unknown-capability routing invariants, payload/depth/sequence-item/mapping-item/pow/expression/task-spec/budget bounds with typed clean failures, hash-chain append/order/tamper/removal/prev-hash/scale integrity checks, secret-redaction and taint-egress/rug-pull-drift models, stronger enforce-mode assertions, latency/overhead measurements and summaries.
