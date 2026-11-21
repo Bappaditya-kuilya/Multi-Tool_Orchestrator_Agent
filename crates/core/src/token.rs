@@ -1215,11 +1215,7 @@ pub mod biscuit_adapter {
                     Err(e) => return Err(e),
                 }
             }
-            if saw_key {
-                Err(TokenError::Revoked)
-            } else {
-                Err(TokenError::Revoked)
-            }
+            Err(TokenError::Revoked)
         }
 
         /// Key-handling hook: verify an encoded token using any accepted root public key and a revocation store.
