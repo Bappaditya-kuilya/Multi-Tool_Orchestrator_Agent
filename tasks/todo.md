@@ -7,7 +7,8 @@
   - Done: core/store audit append-before-return+fail-closed docs/semantics reinforced; InMemory append uses AuditAppendPlan; sqlite write-failure + restart seq-gap tamper tests added. core 93p, store 37p.
   - Gap: full runtime/gateway/e2e fail-closed audit proof across all dispatch paths still needed.
 - [~] Task 3: Restart-safe approvals/revocations/budgets/state
-  - Partial: gateway hook prep on task create + durable revocation sync/fail-closed; gateway tests 117p. Gap: rate/budget counters need store snapshot API (T2 dep).
+  - Done: hook prep on task create + durable revocation sync/fail-closed; rate/budget counters snapshot to store (migration 003, global JSON snapshot) loaded on hook prep and persisted on handle_and_persist_audit, fail-closed on errors. Store+gateway+core tests pass.
+  - Gaps: per-request snapshot write overhead, sync handle path not persisted, coarse config gating, single global snapshot/no integrity signing, config-drift semantics; full restart proof across all scenarios still needed.
 - [~] Task 4: Close 4 capability xfails
   - [x] taint->egress: gateway MCP handler propagates/persists UntrustedContent, merges snapshots, fail-closed on store errors; Rust tests added. Bench case still xfail (live stdio+sqlite E2E not wired).
   - [~] cross-task isolation: handler request-binding/task-approval isolation tests added; xfail reason made precise. NOT proven: true concurrent multi-request isolation (server still serializes via global AppState mutex).

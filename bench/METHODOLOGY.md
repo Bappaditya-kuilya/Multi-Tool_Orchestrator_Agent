@@ -2,7 +2,7 @@
 
 Status: runnable pytest harness for PRD M4 with gateway-independent local models plus gateway-dependent/live integration cases. Provides local enforcement evidence, live-gateway enforcement evidence path (probe/policy/latency checks when endpoint configured), stronger enforce-mode assertions, latency/overhead reporting, and CI artifacts. Collection/execution succeed without a gateway (live cases xfail with explicit reasons when unconfigured).
 
-**Non-live baseline expectation:** `38 passed, 7 xfailed` with explicit gateway-dependent reasons recorded in test output and report artifacts (4 capability-gated cases + 3 live-integration cases when gateway URL not configured).
+**Non-live baseline expectation:** `38 passed, 7 xfailed` with explicit gateway-dependent reasons recorded in test output and report artifacts (1 capability-gated case + 6 live-integration/env-gated cases when gateway URL not configured). With a configured gateway, injection/taint-egress, rug-pull stable-pin, and secret-redaction live E2E cases can pass when enforcement evidence is observed.
 
 ## Semantics
 - **pass**: modeled attack/edge case blocked or invariant preserved by local model/enforcement checks, or live gateway evidence observed (probe/policy denial/latency) when configured and enforced.
@@ -14,12 +14,12 @@ Collection/execution succeed without a gateway. Live cases xfail cleanly when `-
 
 | Class | Marker | Intent | Local-model coverage |
 |---|---|---|---|
-| Injection exfil | `injection_exfil` | Untrusted tool/text steers agent to exfiltrate private data | xfail (needs gateway taint + egress) |
+| Injection exfil | `injection_exfil` | Untrusted tool/text steers agent to exfiltrate private data | live-gated E2E: tools/call seeds UntrustedContent taint; external_egress denied/fail-closed (env-gated xfail when gateway unconfigured) |
 | Scope escalation | `scope_escalation` | Call/token exceeds granted scopes or parent authority | attenuation + no-inflation invariants |
 | Confused deputy | `confused_deputy` | Gateway/tool acts with wrong principal/task authority | correlation invariant; isolation xfail |
 | Tool poisoning | `tool_poisoning` | Poisoned manifest/metadata/output alters routing or privilege | no manifest-scope inflation; clean unknown-capability failure |
-| Rug pull | `rug_pull` | Trusted tool changes behavior/schema after discovery/approval | xfail (needs drift/re-approval lifecycle) |
-| Secret leak | `secret_leak` | Upstream secrets exposed to agent, logs, or responses | xfail (needs redaction boundaries) |
+| Rug pull | `rug_pull` | Trusted tool changes behavior/schema after discovery/approval | live-gated E2E: repeated tools/list stable-pin, no false drift denial; drift-induction needs controllable upstream (env-gated xfail when unconfigured) |
+| Secret leak | `secret_leak` | Upstream secrets exposed to agent, logs, or responses | live-gated E2E: echo-induced secret marker scrubbed/fail-closed; xfail if no echo tool (env-gated xfail when unconfigured) |
 | DoS inputs | `dos_inputs` | Malformed/oversized/expensive inputs crash or hang gateway | depth/payload/pow budgets, typed clean failures |
 | Audit tamper | `audit_tamper` | Audit entries missing/edited or chain unverifiable | SHA-256 hash-chain append/verify, tamper + removal detection |
 
@@ -82,9 +82,9 @@ Markers: `baseline`, `dryrun`, `enforce`, `live` (suite default: `baseline`). Fi
 | `test_dos_inputs_too_many_sequence_items_rejected` | CRASH-06 bounded-structure/list intent | bounded sequence item-count guard, typed clean failure |
 | `test_dos_inputs_task_spec_rejects_more_malformed_shapes` | `reference/tests/test_attacks.py::test_crash05_cli_malformed_task_file_no_traceback` (more variants) | additional malformed/non-object/empty-field shapes rejected with typed errors |
 | `test_tool_poisoning_known_capability_routes_cleanly` | `reference/tests/test_security_routing.py` benign routing intent | known capability resolves cleanly (no poisoning side effects) |
-| `test_injection_exfil_tool_output_to_external_egress` | PRD injection/exfil class (no direct ref exploit; policy/taint class) | gateway-dependent (taint+egress) -> xfail |
-| `test_rug_pull_tool_changes_after_trust` | PRD rug-pull class | gateway-dependent (drift/re-approval) -> xfail |
-| `test_secret_leak_agent_visible_credentials` | PRD secret-leak class | gateway-dependent (redaction/secret boundary) -> xfail |
+| `test_injection_exfil_tool_output_to_external_egress` | PRD injection/exfil class (no direct ref exploit; policy/taint class) | live-gated E2E: tools/call seeds untrusted taint, external_egress denied/fail-closed; env-gated xfail when unconfigured |
+| `test_rug_pull_tool_changes_after_trust` | PRD rug-pull class | live-gated E2E: stable tools/list pin path (no false drift denial); drift-induction requires controllable upstream; env-gated xfail when unconfigured |
+| `test_secret_leak_agent_visible_credentials` | PRD secret-leak class | live-gated E2E: echo-induced secret marker scrubbed or fail-closed; env-gated xfail when unconfigured/no echo tool |
 
 ## Mapping to `reference/tests/test_attacks.py` (finding-keyed)
 - **CRASH-05** (malformed task files, no traceback/clean friendly errors): `test_dos_inputs_malformed_task_spec_rejected_cleanly`, `test_dos_inputs_task_spec_rejects_more_malformed_shapes`, `test_dos_inputs_empty_subtask_or_depth_spec_rejected`, `test_dos_inputs_clean_failure_contract` (local typed-failure contract port of E2-E5/duplicate/structural/empty-field variants).
@@ -98,7 +98,7 @@ Markers: `baseline`, `dryrun`, `enforce`, `live` (suite default: `baseline`). Fi
 - **Audit integrity/tolerance intent** (auditor/CRASH-04/CRASH-10 context): `test_audit_tamper_*` hash-chain append/verify/tamper/removal/ordering/prev-hash/scale-overhead models.
 - **Routing baseline/benign path**: `test_tool_poisoning_known_capability_routes_cleanly`.
 - **Local models for gateway classes (enforcement-ready):** `test_injection_exfil_local_taint_egress_rule`, `test_secret_leak_local_redaction_enforcement`, `test_rug_pull_manifest_hash_drift_detection`.
-- **Live gateway integration (xfail without endpoint):** `test_live_gateway_reachable_for_integration`, `test_live_gateway_policy_denies_out_of_scope`, `test_live_gateway_latency_probe`.
+- **Live gateway integration (xfail without endpoint/configured upstream):** `test_injection_exfil_tool_output_to_external_egress`, `test_rug_pull_tool_changes_after_trust`, `test_secret_leak_agent_visible_credentials`, `test_live_gateway_reachable_for_integration`, `test_live_gateway_policy_denies_out_of_scope`, `test_live_gateway_latency_probe`.
 
 Also aligned with: `reference/tests/test_security_{confinement,depth,pow,queue,routing,tokens}.py`, `reference/tests/test_auditor.py`.
 
@@ -117,7 +117,7 @@ Live gateway helper (`bench/run_local_gateway.sh [mode]`): runs live-marked chec
 
 ## Coverage and porting notes
 - **Local-model (gateway-independent):** scope attenuation/no-inflation/ordering/revocation, benign + unknown-capability routing invariants, payload/depth/sequence-item/mapping-item/pow/expression/task-spec/budget bounds with typed clean failures, hash-chain append/order/tamper/removal/prev-hash/scale integrity checks, secret-redaction and taint-egress/rug-pull-drift models, stronger enforce-mode assertions, latency/overhead measurements and summaries.
-- **Gateway-dependent/live (explicit xfail without endpoint):** injection exfil (taint+egress), confused-deputy isolation in live request handling, rug-pull drift/re-approval lifecycle, secret-leak redaction boundaries, and live health/policy/latency probes. When `SCOPEGATE_GATEWAY_URL` is configured, live cases run and provide endpoint-backed enforcement/latency evidence.
+- **Gateway-dependent/live:** confused-deputy isolation remains capability-gated xfail (concurrent isolation not proven). Injection/taint-egress, rug-pull stable-pin, and secret-redaction are live-gated E2E cases that xfail when gateway/required upstream evidence is unavailable and can pass when configured; live health/policy/latency probes also xfail without endpoint. When `SCOPEGATE_GATEWAY_URL` is configured, live cases run and provide endpoint-backed enforcement/latency evidence.
 - **Reference alignment:** mapped to `reference/tests/test_attacks.py` and `reference/tests/test_security_{confinement,depth,pow,queue,routing,tokens}.py`, `reference/tests/test_auditor.py` as noted above; new cases extend malformed-shape/list-bound/ordering/benign-routing/enforcement/latency coverage while preserving typed clean-failure contracts.
 
 ## Running

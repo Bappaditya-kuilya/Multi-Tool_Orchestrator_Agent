@@ -1168,6 +1168,71 @@ impl Store for SqliteStore {
         }
     }
 
+    async fn save_rate_limit_snapshot(
+        &self,
+        snapshot: crate::RateLimitSnapshotRecord,
+    ) -> StoreResult<crate::RateLimitSnapshotRecord> {
+        #[cfg(feature = "sqlite-sqlx")]
+        {
+            if snapshot.snapshot_json.trim().is_empty() {
+                return Err(StoreError::Invalid(
+                    "rate limit snapshot_json required".into(),
+                ));
+            }
+            let pool = self.pool()?;
+            sqlx::query(
+                "INSERT INTO rate_limit_snapshots (id, snapshot_json, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   snapshot_json=excluded.snapshot_json, \
+                   updated_at=excluded.updated_at",
+            )
+            .bind("global")
+            .bind(&snapshot.snapshot_json)
+            .bind(&snapshot.updated_at)
+            .execute(pool)
+            .await
+            .map_err(|e| map_durable_error("sqlite save rate limit snapshot", e))?;
+            return Ok(snapshot);
+        }
+        #[cfg(not(feature = "sqlite-sqlx"))]
+        {
+            let _ = snapshot;
+            Err(self.durable_unavailable("sqlite save_rate_limit_snapshot"))
+        }
+    }
+
+    async fn load_rate_limit_snapshot(
+        &self,
+    ) -> StoreResult<Option<crate::RateLimitSnapshotRecord>> {
+        #[cfg(feature = "sqlite-sqlx")]
+        {
+            let pool = self.pool()?;
+            let row = sqlx::query(
+                "SELECT snapshot_json, updated_at FROM rate_limit_snapshots WHERE id = ?1",
+            )
+            .bind("global")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| map_durable_error("sqlite load rate limit snapshot", e))?;
+            if let Some(r) = row {
+                return Ok(Some(crate::RateLimitSnapshotRecord {
+                    snapshot_json: r
+                        .try_get("snapshot_json")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    updated_at: r
+                        .try_get("updated_at")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                }));
+            }
+            return Ok(None);
+        }
+        #[cfg(not(feature = "sqlite-sqlx"))]
+        {
+            Err(self.durable_unavailable("sqlite load_rate_limit_snapshot"))
+        }
+    }
+
     async fn health_check(&self) -> StoreResult<()> {
         #[cfg(feature = "sqlite-sqlx")]
         {
@@ -1553,7 +1618,7 @@ mod tests {
         .unwrap();
         store.connect().await.unwrap();
         let first_mig = store.migrate().await.unwrap();
-        assert_eq!(first_mig, vec![1, 2]);
+        assert_eq!(first_mig, vec![1, 2, 3]);
 
         store
             .upsert_policy(PolicyRecord {
@@ -2146,6 +2211,49 @@ mod tests {
         assert!(rep.ok && rep.checked_events == 2);
         let evs = reopened2.query_audit(AuditQuery::default()).await.unwrap();
         assert_eq!(evs[1].prev_hash, evs[0].hash);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+    }
+
+    #[cfg(feature = "sqlite-sqlx")]
+    #[tokio::test]
+    async fn sqlite_rate_limit_snapshot_restart_roundtrip() {
+        let path = format!(
+            "/tmp/opencode/store-rlsnap-{}-{}.db",
+            std::process::id(),
+            "s1"
+        );
+        let url = format!("sqlite://{path}?mode=rwc");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+
+        let mut store = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url.clone(),
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        store.connect().await.unwrap();
+        store.migrate().await.unwrap();
+        let rec = crate::RateLimitSnapshotRecord {
+            snapshot_json: r#"{"tokens":{"tok":{"total_calls":3,"budget_used":9,"token_window":{"window_start":0,"count":3},"tool_windows":{},"tool_calls":{"t":3}}}}"#.into(),
+            updated_at: "10".into(),
+        };
+        store.save_rate_limit_snapshot(rec.clone()).await.unwrap();
+        drop(store);
+
+        let mut reopened = SqliteStore::new(StoreConfig {
+            backend: BackendKind::SqliteWal,
+            database_url: url,
+            fail_closed_on_audit_error: true,
+        })
+        .unwrap();
+        reopened.connect().await.unwrap();
+        let loaded = reopened.load_rate_limit_snapshot().await.unwrap().unwrap();
+        assert_eq!(loaded, rec);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-shm"));

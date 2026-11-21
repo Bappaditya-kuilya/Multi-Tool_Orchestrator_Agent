@@ -1144,6 +1144,71 @@ impl Store for PostgresStore {
         }
     }
 
+    async fn save_rate_limit_snapshot(
+        &self,
+        snapshot: crate::RateLimitSnapshotRecord,
+    ) -> StoreResult<crate::RateLimitSnapshotRecord> {
+        #[cfg(feature = "postgres-sqlx")]
+        {
+            if snapshot.snapshot_json.trim().is_empty() {
+                return Err(StoreError::Invalid(
+                    "rate limit snapshot_json required".into(),
+                ));
+            }
+            let pool = self.pool()?;
+            sqlx::query(
+                "INSERT INTO rate_limit_snapshots (id, snapshot_json, updated_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   snapshot_json=EXCLUDED.snapshot_json, \
+                   updated_at=EXCLUDED.updated_at",
+            )
+            .bind("global")
+            .bind(&snapshot.snapshot_json)
+            .bind(&snapshot.updated_at)
+            .execute(pool)
+            .await
+            .map_err(|e| map_durable_error("postgres save rate limit snapshot", e))?;
+            return Ok(snapshot);
+        }
+        #[cfg(not(feature = "postgres-sqlx"))]
+        {
+            let _ = snapshot;
+            Err(self.durable_unavailable("postgres save_rate_limit_snapshot"))
+        }
+    }
+
+    async fn load_rate_limit_snapshot(
+        &self,
+    ) -> StoreResult<Option<crate::RateLimitSnapshotRecord>> {
+        #[cfg(feature = "postgres-sqlx")]
+        {
+            let pool = self.pool()?;
+            let row = sqlx::query(
+                "SELECT snapshot_json, updated_at FROM rate_limit_snapshots WHERE id = $1",
+            )
+            .bind("global")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| map_durable_error("postgres load rate limit snapshot", e))?;
+            if let Some(r) = row {
+                return Ok(Some(crate::RateLimitSnapshotRecord {
+                    snapshot_json: r
+                        .try_get("snapshot_json")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                    updated_at: r
+                        .try_get("updated_at")
+                        .map_err(|e| StoreError::Invalid(e.to_string()))?,
+                }));
+            }
+            return Ok(None);
+        }
+        #[cfg(not(feature = "postgres-sqlx"))]
+        {
+            Err(self.durable_unavailable("postgres load_rate_limit_snapshot"))
+        }
+    }
+
     async fn health_check(&self) -> StoreResult<()> {
         #[cfg(feature = "postgres-sqlx")]
         {

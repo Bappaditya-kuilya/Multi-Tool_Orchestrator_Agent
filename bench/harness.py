@@ -337,6 +337,28 @@ def get_live_gateway(url: str | None = None, timeout_s: float = 2.0) -> LiveGate
     return LiveGateway(base_url=base, timeout_s=timeout_s)
 
 
+def mcp_post_jsonrpc(
+    gw: LiveGateway,
+    rpc: Mapping[str, Any],
+    *,
+    path: str = "/mcp",
+) -> tuple[int, Any, float]:
+    """POST a JSON-RPC payload to the gateway MCP HTTP endpoint.
+
+    Tries the gateway wrapper format first ({method:"", payload_json:"..."}),
+    then falls back to raw JSON-RPC if the wrapper is rejected as invalid.
+    Returns (status, parsed_body, elapsed_s).
+    """
+    wrapped = {"method": "", "payload_json": json.dumps(rpc)}
+    status, body, elapsed = gw.post_json(path, wrapped)
+    if status == 400 and isinstance(body, dict):
+        # Some gateway builds may prefer raw JSON-RPC; retry once.
+        msg = str(body.get("error") or body).lower()
+        if "invalid mcp request" in msg or "invalid or missing json body" in msg:
+            return gw.post_json(path, rpc)
+    return status, body, elapsed
+
+
 def gateway_env_summary(url: str | None = None) -> dict[str, Any]:
     """CI/helper summary for live gateway runs."""
     base = (url or os.getenv("SCOPEGATE_GATEWAY_URL", "")).strip()

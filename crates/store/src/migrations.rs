@@ -15,8 +15,12 @@ pub struct Migration {
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "_schema_migrations";
 pub const SQLITE_001_INIT: &str = include_str!("../migrations/sqlite/001_init.sql");
 pub const SQLITE_002_TOOL_PINS: &str = include_str!("../migrations/sqlite/002_tool_pins.sql");
+pub const SQLITE_003_RATE_LIMIT_SNAPSHOTS: &str =
+    include_str!("../migrations/sqlite/003_rate_limit_snapshots.sql");
 pub const POSTGRES_001_INIT: &str = include_str!("../migrations/postgres/001_init.sql");
 pub const POSTGRES_002_TOOL_PINS: &str = include_str!("../migrations/postgres/002_tool_pins.sql");
+pub const POSTGRES_003_RATE_LIMIT_SNAPSHOTS: &str =
+    include_str!("../migrations/postgres/003_rate_limit_snapshots.sql");
 
 pub fn sqlite_migrations() -> &'static [Migration] {
     &[
@@ -29,6 +33,11 @@ pub fn sqlite_migrations() -> &'static [Migration] {
             version: 2,
             name: "002_tool_pins",
             sql: SQLITE_002_TOOL_PINS,
+        },
+        Migration {
+            version: 3,
+            name: "003_rate_limit_snapshots",
+            sql: SQLITE_003_RATE_LIMIT_SNAPSHOTS,
         },
     ]
 }
@@ -44,6 +53,11 @@ pub fn postgres_migrations() -> &'static [Migration] {
             version: 2,
             name: "002_tool_pins",
             sql: POSTGRES_002_TOOL_PINS,
+        },
+        Migration {
+            version: 3,
+            name: "003_rate_limit_snapshots",
+            sql: POSTGRES_003_RATE_LIMIT_SNAPSHOTS,
         },
     ]
 }
@@ -307,17 +321,23 @@ mod tests {
     fn embedded_migrations_present() {
         let sqlite = sqlite_migrations();
         let pg = postgres_migrations();
-        assert_eq!(sqlite.len(), 2);
-        assert_eq!(pg.len(), 2);
+        assert_eq!(sqlite.len(), 3);
+        assert_eq!(pg.len(), 3);
         assert!(sqlite[0]
             .sql
             .contains("CREATE TABLE IF NOT EXISTS audit_events"));
         assert!(sqlite[1]
             .sql
             .contains("CREATE TABLE IF NOT EXISTS tool_pins"));
+        assert!(sqlite[2]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS rate_limit_snapshots"));
         assert!(pg[0].sql.contains("hash BYTEA"));
         assert!(pg[0].sql.contains("labels_json TEXT"));
         assert!(pg[1].sql.contains("CREATE TABLE IF NOT EXISTS tool_pins"));
+        assert!(pg[2]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS rate_limit_snapshots"));
     }
 
     #[test]
@@ -326,16 +346,20 @@ mod tests {
         validate_migrations(migrations).unwrap();
         assert_eq!(
             pending_migration_versions(migrations, &[]).unwrap(),
-            vec![1, 2]
+            vec![1, 2, 3]
         );
         assert_eq!(
             pending_migration_versions(migrations, &[1]).unwrap(),
-            vec![2]
+            vec![2, 3]
         );
-        assert!(pending_migration_versions(migrations, &[1, 2])
+        assert_eq!(
+            pending_migration_versions(migrations, &[1, 2]).unwrap(),
+            vec![3]
+        );
+        assert!(pending_migration_versions(migrations, &[1, 2, 3])
             .unwrap()
             .is_empty());
-        let err = pending_migration_versions(migrations, &[3]).unwrap_err();
+        let err = pending_migration_versions(migrations, &[4]).unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)));
 
         let bad = [Migration {
@@ -354,7 +378,7 @@ mod tests {
     async fn sqlite_apply_migrations_runs() {
         let url = "sqlite:file:mig_apply?mode=memory&cache=shared";
         let versions = apply_migrations(BackendKind::SqliteWal, url).await.unwrap();
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
     }
 
     #[cfg(feature = "sqlite-sqlx")]
@@ -365,7 +389,7 @@ mod tests {
         let url = "sqlite:file:mig_apply_idempotent?mode=memory&cache=shared";
         let mut _keeper = SqliteConnection::connect(url).await.unwrap();
         let first = apply_migrations(BackendKind::SqliteWal, url).await.unwrap();
-        assert_eq!(first, vec![1, 2]);
+        assert_eq!(first, vec![1, 2, 3]);
         let second = apply_migrations(BackendKind::SqliteWal, url).await.unwrap();
         assert!(second.is_empty());
 
@@ -374,6 +398,6 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 }

@@ -8,7 +8,7 @@ Pytest-based attack benchmark harness for ScopeGate (PRD M4 / F10). Maps PRD att
 - **xfail**: gateway-dependent capability not currently enforced/provable, or live integration case when endpoint not configured/reachable; documented reason in test output and captured explicitly in reports/artifacts, does not fail CI by default.
 - **skip**: reserved for environment gating (not used for core coverage).
 - **enforce mode**: stronger assertions require modeled attacks/denials to hold as blocked evidence; live policy checks must observe denial when reachable.
-- **Baseline expectation (no live gateway configured):** `38 passed, 7 xfailed` — 4 gateway-capability cases + 3 live-integration cases xfailed with explicit reasons.
+- **Baseline expectation (no live gateway configured):** `38 passed, 7 xfailed` — 1 gateway-capability case (confused-deputy isolation) + 6 live-integration/env-gated cases xfailed with explicit reasons. With a configured gateway, the 3 wired live E2E cases (injection/taint egress, rug-pull stable-pin, secret redaction) can pass when enforcement evidence is observed.
 - **Live gateway configured (`SCOPEGATE_GATEWAY_URL` reachable):** live integration probe/policy-denial/latency cases can pass when enforced, reducing xfails to capability-gated cases that remain unimplemented (precise reasons retained).
 
 ## Layout

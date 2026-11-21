@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::policy::{BudgetHint, CallCountHint, PolicyDecision, RateLimitHint};
 
 /// Fixed-window rate limit configuration.
@@ -25,6 +27,29 @@ pub struct Limits {
     pub per_token_call_limit: Option<u32>,
     /// Unit budget per token (e.g. tokens/cost units).
     pub per_token_budget: Option<u64>,
+}
+
+/// Serializable window counter snapshot for restart-safe persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RateLimitWindowSnapshot {
+    pub window_start: u64,
+    pub count: u32,
+}
+
+/// Serializable per-token counter snapshot for restart-safe persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RateLimitTokenSnapshot {
+    pub total_calls: u32,
+    pub budget_used: u64,
+    pub token_window: RateLimitWindowSnapshot,
+    pub tool_windows: HashMap<String, RateLimitWindowSnapshot>,
+    pub tool_calls: HashMap<String, u32>,
+}
+
+/// Serializable tracker snapshot for restart-safe persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RateLimitTrackerSnapshot {
+    pub tokens: HashMap<String, RateLimitTokenSnapshot>,
 }
 
 /// Outcome of a rate/budget check.
@@ -119,6 +144,71 @@ impl InMemoryRateLimitTracker {
 
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Export a serializable snapshot of all counter state for restart-safe persistence.
+    pub fn snapshot(&self) -> RateLimitTrackerSnapshot {
+        let mut tokens = HashMap::with_capacity(self.tokens.len());
+        for (k, v) in &self.tokens {
+            tokens.insert(
+                k.clone(),
+                RateLimitTokenSnapshot {
+                    total_calls: v.total_calls,
+                    budget_used: v.budget_used,
+                    token_window: RateLimitWindowSnapshot {
+                        window_start: v.token_window.window_start,
+                        count: v.token_window.count,
+                    },
+                    tool_windows: v
+                        .tool_windows
+                        .iter()
+                        .map(|(tk, tw)| {
+                            (
+                                tk.clone(),
+                                RateLimitWindowSnapshot {
+                                    window_start: tw.window_start,
+                                    count: tw.count,
+                                },
+                            )
+                        })
+                        .collect(),
+                    tool_calls: v.tool_calls.clone(),
+                },
+            );
+        }
+        RateLimitTrackerSnapshot { tokens }
+    }
+
+    /// Restore counter state from a persisted snapshot. Replaces existing token counters.
+    pub fn restore_snapshot(&mut self, snapshot: RateLimitTrackerSnapshot) {
+        self.tokens.clear();
+        for (k, v) in snapshot.tokens {
+            self.tokens.insert(
+                k,
+                TokenState {
+                    total_calls: v.total_calls,
+                    budget_used: v.budget_used,
+                    token_window: WindowState {
+                        window_start: v.token_window.window_start,
+                        count: v.token_window.count,
+                    },
+                    tool_windows: v
+                        .tool_windows
+                        .into_iter()
+                        .map(|(tk, tw)| {
+                            (
+                                tk,
+                                WindowState {
+                                    window_start: tw.window_start,
+                                    count: tw.count,
+                                },
+                            )
+                        })
+                        .collect(),
+                    tool_calls: v.tool_calls,
+                },
+            );
+        }
     }
 
     /// Returns the current call count for a token within its configured window

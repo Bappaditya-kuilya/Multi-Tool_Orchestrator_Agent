@@ -25,6 +25,7 @@ from harness import (
     enforce_pow,
     enforce_scope_check,
     get_live_gateway,
+    mcp_post_jsonrpc,
     measure_call,
     require_known_capability,
     safe_route_lookup,
@@ -58,15 +59,65 @@ except Exception:  # pragma: no cover
 # - reference/tests/test_auditor.py -> audit_tamper primitives (integrity/sanitization intent).
 
 
+@pytest.mark.live
 @pytest.mark.injection_exfil
-def test_injection_exfil_tool_output_to_external_egress(bench_mode: str) -> None:
-    """Gateway MCP handler enforces taint propagation/persistence; live stdio+sqlite E2E harness not wired."""
-    pytest.xfail(
-        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
-        "gateway MCP handler now marks tools/call output as UntrustedContent, "
-        "persists/merges session taint snapshots (task_id/token/principal key), "
-        "and fail-closes on taint store read/write errors before egress/policy eval; "
-        "see crates/gateway/src/mcp.rs tests for enforcement evidence"
+def test_injection_exfil_tool_output_to_external_egress(gateway_url: str) -> None:
+    """Live E2E: tools/call output becomes untrusted taint; external egress is denied/fail-closed."""
+    url = require_live_gateway(gateway_url)
+    gw = get_live_gateway(url)
+    assert gw is not None
+
+    def _unwrap(status: int, body: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        assert status != 0, f"gateway call failed to connect: {body!r}"
+        assert isinstance(body, dict), f"expected MCP wrapper dict, got {status} {body!r}"
+        inner_raw = body.get("payload_json")
+        assert isinstance(inner_raw, str) and inner_raw.strip(), f"missing payload_json: {body!r}"
+        inner = json.loads(inner_raw)
+        assert isinstance(inner, dict), f"expected JSON-RPC object: {inner!r}"
+        return body, inner
+
+    # 1) Successful tools/call seeds UntrustedContent taint in gateway session store.
+    first_rpc = {
+        "jsonrpc": "2.0",
+        "id": 1001,
+        "method": "tools/call",
+        "params": {"name": "gateway.health"},
+    }
+    status, body, _ = mcp_post_jsonrpc(gw, first_rpc)
+    outer, inner = _unwrap(status, body)
+    if outer.get("ok") is not True:
+        err_msg = str(((inner.get("error") or {}) if isinstance(inner.get("error"), dict) else {}).get("message") or "")
+        if "taint persistence" in err_msg.lower() or "store" in err_msg.lower():
+            pytest.xfail(
+                "live gateway configured but taint persistence/store not available for E2E proof: "
+                f"{inner!r}"
+            )
+        assert outer.get("ok") is True, f"seed tools/call should succeed: {body!r}"
+    assert outer.get("fail_closed") is False, f"seed tools/call should not fail-closed: {body!r}"
+    assert "result" in inner, f"seed tools/call missing result: {inner!r}"
+    assert "error" not in inner, f"seed tools/call returned error: {inner!r}"
+
+    # 2) External egress after untrusted tool output must be denied/fail-closed by taint policy.
+    second_rpc = {
+        "jsonrpc": "2.0",
+        "id": 1002,
+        "method": "tools/call",
+        "params": {
+            "name": "gateway.health",
+            "operation": "external_egress",
+            "taint_labels": ["private_data"],
+        },
+    }
+    status, body, _ = mcp_post_jsonrpc(gw, second_rpc)
+    outer, inner = _unwrap(status, body)
+    assert outer.get("ok") is False, f"taint egress call must not succeed: {body!r}"
+    assert outer.get("fail_closed") is True, f"taint egress call must fail-closed: {body!r}"
+    err = inner.get("error") if isinstance(inner.get("error"), dict) else {}
+    msg = str(err.get("message") or "")
+    msg_l = msg.lower()
+    assert "taint" in msg_l or "approval required" in msg_l, (
+        "expected taint/approval denial message, "
+        f"got: {inner!r}"
     )
 
 
@@ -139,26 +190,133 @@ def test_tool_poisoning_unknown_capability_fails_cleanly() -> None:
         require_known_capability(registry, "no-such-capability")
 
 
+@pytest.mark.live
 @pytest.mark.rug_pull
-def test_rug_pull_tool_changes_after_trust(bench_mode: str) -> None:
-    """Gateway MCP handler enforces tool-manifest pinning on tools/list; live stdio+sqlite E2E harness not wired."""
-    pytest.xfail(
-        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
-        "gateway MCP tools/list now pins tool descriptors (name, description, inputSchema hash) "
-        "in the durable store, records first-seen approved baselines, and fail-closes on "
-        "descriptor drift, unapproved pins, or pin store read/write errors with explicit "
-        "re-approval-required denial; see crates/gateway/src/mcp.rs and crates/store/src/lib.rs tests"
+def test_rug_pull_tool_changes_after_trust(gateway_url: str) -> None:
+    """Live E2E: tools/list pins descriptors and does not falsely deny stable tool manifests.
+
+    Drift-denial (descriptor change after trust) requires a controllable upstream that can mutate
+    tool descriptors between tools/list calls; that cannot be induced reliably through a generic
+    configured gateway URL alone. This live test proves the observable stable-pin path: repeated
+    tools/list calls succeed with consistent tool descriptors and no false drift/re-approval denial.
+    Handler-level drift denial is covered by crates/gateway/src/mcp.rs tests.
+    """
+    url = require_live_gateway(gateway_url)
+    gw = get_live_gateway(url)
+    assert gw is not None
+
+    def _unwrap(status: int, body: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        assert status != 0, f"gateway call failed to connect: {body!r}"
+        assert isinstance(body, dict), f"expected MCP wrapper dict, got {status} {body!r}"
+        inner_raw = body.get("payload_json")
+        assert isinstance(inner_raw, str) and inner_raw.strip(), f"missing payload_json: {body!r}"
+        inner = json.loads(inner_raw)
+        assert isinstance(inner, dict), f"expected JSON-RPC object: {inner!r}"
+        return body, inner
+
+    def _tool_names(inner: dict[str, Any]) -> list[str]:
+        result = inner.get("result")
+        assert isinstance(result, dict), f"tools/list missing result object: {inner!r}"
+        tools = result.get("tools")
+        assert isinstance(tools, list), f"tools/list missing tools array: {inner!r}"
+        names: list[str] = []
+        for t in tools:
+            if isinstance(t, dict) and isinstance(t.get("name"), str):
+                names.append(t["name"])
+        return names
+
+    rpc = {"jsonrpc": "2.0", "id": 2001, "method": "tools/list", "params": {}}
+    status1, body1, _ = mcp_post_jsonrpc(gw, rpc)
+    outer1, inner1 = _unwrap(status1, body1)
+    assert outer1.get("ok") is True, f"first tools/list should succeed: {body1!r}"
+    assert outer1.get("fail_closed") is False, f"first tools/list should not fail-closed: {body1!r}"
+    assert "error" not in inner1, f"first tools/list returned error: {inner1!r}"
+    names1 = _tool_names(inner1)
+    assert names1, f"tools/list should return at least one tool: {inner1!r}"
+
+    rpc2 = {"jsonrpc": "2.0", "id": 2002, "method": "tools/list", "params": {}}
+    status2, body2, _ = mcp_post_jsonrpc(gw, rpc2)
+    outer2, inner2 = _unwrap(status2, body2)
+    assert outer2.get("ok") is True, f"second tools/list should not be falsely denied: {body2!r}"
+    assert outer2.get("fail_closed") is False, f"second tools/list should not fail-closed: {body2!r}"
+    err = inner2.get("error") if isinstance(inner2.get("error"), dict) else {}
+    err_msg = str(err.get("message") or "")
+    assert "drift" not in err_msg.lower() and "re-approval" not in err_msg.lower(), (
+        "stable tools/list must not trigger drift/re-approval denial: "
+        f"{inner2!r}"
     )
+    names2 = _tool_names(inner2)
+    assert names1 == names2, f"stable tools/list descriptors changed unexpectedly: {names1!r} != {names2!r}"
 
 
+@pytest.mark.live
 @pytest.mark.secret_leak
-def test_secret_leak_agent_visible_credentials(bench_mode: str) -> None:
-    """Gateway MCP handler redacts agent-visible secret markers; live stdio+sqlite E2E harness not wired."""
+def test_secret_leak_agent_visible_credentials(gateway_url: str) -> None:
+    """Live E2E: secret markers in agent-visible MCP responses are scrubbed or fail-closed."""
+    url = require_live_gateway(gateway_url)
+    gw = get_live_gateway(url)
+    assert gw is not None
+
+    def _unwrap(status: int, body: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        assert status != 0, f"gateway call failed to connect: {body!r}"
+        assert isinstance(body, dict), f"expected MCP wrapper dict, got {status} {body!r}"
+        inner_raw = body.get("payload_json")
+        assert isinstance(inner_raw, str) and inner_raw.strip(), f"missing payload_json: {body!r}"
+        inner = json.loads(inner_raw)
+        assert isinstance(inner, dict), f"expected JSON-RPC object: {inner!r}"
+        return body, inner
+
+    # Discover an echo-capable tool to induce a secret-bearing upstream response.
+    list_rpc = {"jsonrpc": "2.0", "id": 3001, "method": "tools/list", "params": {}}
+    status, body, _ = mcp_post_jsonrpc(gw, list_rpc)
+    outer, inner = _unwrap(status, body)
+    if outer.get("ok") is not True or "result" not in inner:
+        pytest.xfail(f"live gateway tools/list unavailable for secret-leak probe: {body!r}")
+    tools = (inner.get("result") or {}).get("tools") if isinstance(inner.get("result"), dict) else None
+    tools = tools if isinstance(tools, list) else []
+    echo_name = None
+    for t in tools:
+        if isinstance(t, dict):
+            name = t.get("name")
+            if isinstance(name, str) and "echo" in name.lower():
+                echo_name = name
+                break
+    if not echo_name:
+        pytest.xfail(
+            "live gateway configured but no echo-capable MCP tool discovered; "
+            "cannot induce secret-bearing upstream response without controllable echo upstream "
+            f"(tools={[t.get('name') for t in tools if isinstance(t, dict)]!r})"
+        )
+
+    secret_marker = "sk-benchSecretMarker1234567890"
+    call_rpc = {
+        "jsonrpc": "2.0",
+        "id": 3002,
+        "method": "tools/call",
+        "params": {"name": echo_name, "arguments": {"message": f"leak {secret_marker}"}},
+    }
+    status, body, _ = mcp_post_jsonrpc(gw, call_rpc)
+    outer, inner = _unwrap(status, body)
+    serialized = json.dumps(body, sort_keys=True)
+    assert secret_marker not in serialized, (
+        "agent-visible MCP response leaked raw secret marker: "
+        f"{body!r}"
+    )
+    # Enforcement evidence: scrubbed success ([REDACTED]) or fail-closed redaction failure.
+    if "[REDACTED]" in serialized:
+        return
+    if outer.get("ok") is False:
+        assert outer.get("fail_closed") is True, f"secret-handling failure must fail-closed: {body!r}"
+        err = inner.get("error") if isinstance(inner.get("error"), dict) else {}
+        msg = str(err.get("message") or "").lower()
+        assert "redact" in msg or "secret" in msg or "fail-closed" in msg, (
+            f"expected redaction/fail-closed evidence, got: {inner!r}"
+        )
+        return
     pytest.xfail(
-        "gateway-dependent xfail (live stdio+sqlite bench E2E not wired): "
-        "gateway MCP handler now scrubs/redacts obvious secret markers from agent-visible "
-        "MCP responses/errors and fail-closes if redaction cannot be safely applied; "
-        "see crates/gateway/src/mcp.rs tests for enforcement evidence"
+        "live gateway echo tool did not reflect secret marker in agent-visible response; "
+        "cannot prove scrub/redaction path without secret-bearing upstream output "
+        f"(tool={echo_name!r}, body={body!r})"
     )
 
 

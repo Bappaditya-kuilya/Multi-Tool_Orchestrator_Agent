@@ -328,6 +328,16 @@ pub struct ToolPinRecord {
     pub approved: bool,
 }
 
+/// Persisted rate/budget counter snapshot for restart-safe enforcement.
+/// Stores serialized tracker state; gateway owns validation/restore semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RateLimitSnapshotRecord {
+    /// JSON-serialized `scopegate_core::rate_limit::RateLimitTrackerSnapshot`.
+    pub snapshot_json: String,
+    /// Opaque update timestamp for observability.
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalQuery {
     pub task_id: Option<String>,
@@ -419,6 +429,13 @@ pub trait Store: Send + Sync {
         tool_name: &str,
     ) -> StoreResult<Option<ToolPinRecord>>;
     async fn upsert_tool_pin(&self, record: ToolPinRecord) -> StoreResult<ToolPinRecord>;
+    /// Persist rate/budget counter snapshot for restart-safe enforcement.
+    async fn save_rate_limit_snapshot(
+        &self,
+        snapshot: RateLimitSnapshotRecord,
+    ) -> StoreResult<RateLimitSnapshotRecord>;
+    /// Load persisted rate/budget counter snapshot, if any.
+    async fn load_rate_limit_snapshot(&self) -> StoreResult<Option<RateLimitSnapshotRecord>>;
     async fn health_check(&self) -> StoreResult<()>;
 }
 
@@ -502,6 +519,15 @@ impl Store for UnimplementedStore {
     }
     async fn upsert_tool_pin(&self, _record: ToolPinRecord) -> StoreResult<ToolPinRecord> {
         Err(StoreError::NotImplemented("upsert_tool_pin"))
+    }
+    async fn save_rate_limit_snapshot(
+        &self,
+        _snapshot: RateLimitSnapshotRecord,
+    ) -> StoreResult<RateLimitSnapshotRecord> {
+        Err(StoreError::NotImplemented("save_rate_limit_snapshot"))
+    }
+    async fn load_rate_limit_snapshot(&self) -> StoreResult<Option<RateLimitSnapshotRecord>> {
+        Err(StoreError::NotImplemented("load_rate_limit_snapshot"))
     }
     async fn health_check(&self) -> StoreResult<()> {
         Err(StoreError::NotImplemented("health_check"))
@@ -602,6 +628,7 @@ struct InMemoryState {
     revocations: HashMap<String, RevocationRecord>,
     taint_snapshots: HashMap<String, TaintSnapshotRecord>,
     tool_pins: HashMap<String, ToolPinRecord>,
+    rate_limit_snapshot: Option<RateLimitSnapshotRecord>,
     next_seq: i64,
 }
 
@@ -997,6 +1024,25 @@ impl Store for InMemoryStore {
         let key = format!("{}\0{}", record.upstream_id, record.tool_name);
         st.tool_pins.insert(key, record.clone());
         Ok(record)
+    }
+
+    async fn save_rate_limit_snapshot(
+        &self,
+        snapshot: RateLimitSnapshotRecord,
+    ) -> StoreResult<RateLimitSnapshotRecord> {
+        if snapshot.snapshot_json.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "rate limit snapshot_json required".into(),
+            ));
+        }
+        let mut st = self.lock()?;
+        st.rate_limit_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn load_rate_limit_snapshot(&self) -> StoreResult<Option<RateLimitSnapshotRecord>> {
+        let st = self.lock()?;
+        Ok(st.rate_limit_snapshot.clone())
     }
 
     async fn health_check(&self) -> StoreResult<()> {
@@ -1736,6 +1782,29 @@ mod tests {
                 tool_name: "t".into(),
                 descriptor_hash: "".into(),
                 ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_snapshot_roundtrip_and_validation() {
+        let store = InMemoryStore::default();
+        assert!(store.load_rate_limit_snapshot().await.unwrap().is_none());
+        let rec = RateLimitSnapshotRecord {
+            snapshot_json: r#"{"tokens":{"tok":{"total_calls":2,"budget_used":5,"token_window":{"window_start":0,"count":2},"tool_windows":{},"tool_calls":{"tool":2}}}}"#.into(),
+            updated_at: "1".into(),
+        };
+        let saved = store.save_rate_limit_snapshot(rec.clone()).await.unwrap();
+        assert_eq!(saved, rec);
+        let loaded = store.load_rate_limit_snapshot().await.unwrap().unwrap();
+        assert_eq!(loaded, rec);
+
+        let err = store
+            .save_rate_limit_snapshot(RateLimitSnapshotRecord {
+                snapshot_json: " ".into(),
+                updated_at: "2".into(),
             })
             .await
             .unwrap_err();

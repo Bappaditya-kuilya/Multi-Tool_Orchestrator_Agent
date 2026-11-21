@@ -19,6 +19,7 @@ cedar = ["dep:cedar-policy"]
 biscuit-auth = { workspace = true, optional = true }
 cedar-policy = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+serde.workspace = true
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]

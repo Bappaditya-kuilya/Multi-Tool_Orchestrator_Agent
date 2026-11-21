@@ -19,14 +19,14 @@ use serde::Serialize;
 use serde_json::Value;
 use store::{
     ApprovalQuery, ApprovalRecord, ApprovalStatus as StoreApprovalStatus, AuditEvent,
-    RevocationQuery, Store,
+    RateLimitSnapshotRecord, RevocationQuery, Store,
 };
 use tokio::sync::broadcast;
 
 use crate::config::GatewayConfig;
 use crate::lifecycle::{
-    audit_persistence_denied, handle_request_with_hooks_and_log, to_store_audit_event,
-    GatewayOutcome, InboundRequest,
+    audit_persistence_denied, handle_request_with_hooks_and_log, runtime_integration_denied,
+    to_store_audit_event, GatewayOutcome, InboundRequest, Stage,
 };
 
 #[derive(Debug, Default)]
@@ -570,6 +570,63 @@ impl AppState {
         Ok(restored)
     }
 
+    /// Load persisted rate/budget counters into the in-memory tracker.
+    /// Fail-closed on store read/deserialize errors when rate-limit state is enabled with a store.
+    pub async fn load_rate_limit_snapshot_from_store(&mut self) -> Result<bool, String> {
+        if !self.config.runtime_hooks.enable_rate_limit_state {
+            return Ok(false);
+        }
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        let rec = store
+            .load_rate_limit_snapshot()
+            .await
+            .map_err(|e| format!("rate limit snapshot load failed (fail-closed): {e}"))?;
+        let Some(rec) = rec else {
+            return Ok(false);
+        };
+        let snapshot: scopegate_core::rate_limit::RateLimitTrackerSnapshot =
+            serde_json::from_str(&rec.snapshot_json).map_err(|e| {
+                format!("rate limit snapshot deserialize failed (fail-closed): {e}")
+            })?;
+        self.configure_rate_limit_state();
+        let Some(tracker) = self.rate_tracker.as_mut() else {
+            return Ok(false);
+        };
+        tracker.restore_snapshot(snapshot);
+        Ok(true)
+    }
+
+    /// Persist current rate/budget counters for restart-safe recovery.
+    /// Fail-closed on serialize/store errors when rate-limit state is enabled with a store.
+    pub async fn persist_rate_limit_snapshot_to_store(&self) -> Result<bool, String> {
+        if !self.config.runtime_hooks.enable_rate_limit_state {
+            return Ok(false);
+        }
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        let Some(tracker) = &self.rate_tracker else {
+            return Ok(false);
+        };
+        let snapshot_json = serde_json::to_string(&tracker.snapshot())
+            .map_err(|e| format!("rate limit snapshot serialize failed (fail-closed): {e}"))?;
+        let updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let rec = RateLimitSnapshotRecord {
+            snapshot_json,
+            updated_at,
+        };
+        store
+            .save_rate_limit_snapshot(rec)
+            .await
+            .map_err(|e| format!("rate limit snapshot save failed (fail-closed): {e}"))?;
+        Ok(true)
+    }
+
     /// Apply configured durable hooks before handling (sync-revocations/rate-limit/approval state).
     /// Fail-closed on store sync/rehydration errors when hooks require durable state.
     pub async fn prepare_runtime_hooks(&mut self) -> Result<(), String> {
@@ -578,6 +635,7 @@ impl AppState {
             return Err("revocation sync hook requires store (fail-closed)".into());
         }
         self.sync_revocations_from_store().await.map(|_| ())?;
+        self.load_rate_limit_snapshot_from_store().await?;
         if self.config.runtime_hooks.use_approval_store {
             if self.store.is_none() {
                 return Err("approval store hook requires store (fail-closed)".into());
@@ -826,6 +884,29 @@ impl AppState {
                     task_id: Some(req.task_id.clone()),
                 });
                 return (audit_persistence_denied(&audit_log, e), audit_log);
+            }
+        }
+        if self.config.runtime_hooks.enable_rate_limit_state && self.store.is_some() {
+            if let Err(e) = self.persist_rate_limit_snapshot_to_store().await {
+                if out.allowed {
+                    self.metrics
+                        .requests_allowed
+                        .fetch_sub(1, Ordering::Relaxed);
+                    self.metrics.requests_denied.fetch_add(1, Ordering::Relaxed);
+                }
+                self.emit_event(StreamEvent {
+                    kind: "rate_limit.persist_denied".into(),
+                    message: format!("rate limit snapshot persist failed: {e}"),
+                    task_id: Some(req.task_id.clone()),
+                });
+                return (
+                    runtime_integration_denied(
+                        &audit_log,
+                        Stage::BudgetRateLimit,
+                        format!("rate limit snapshot persistence failed (fail-closed): {e}"),
+                    ),
+                    audit_log,
+                );
             }
         }
         (out, audit_log)
@@ -1232,6 +1313,58 @@ for line in sys.stdin:
         assert!(state.has_rate_tracker());
     }
 
+    #[tokio::test]
+    async fn rate_limit_snapshot_restarts_restore_counters_fail_closed() {
+        let store = Arc::new(InMemoryStore::default()) as Arc<dyn Store>;
+        let mut state1 = AppState::fail_closed().with_store(store.clone());
+        state1.config = state1.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        state1.config.runtime_hooks.enable_rate_limit_state = true;
+        state1.config.rate_limits.per_token_call_limit = Some(2);
+        state1.prepare_runtime_hooks().await.unwrap();
+
+        let req = base_req();
+        let (out1, _) = state1.handle_and_persist_audit(&req).await;
+        assert!(
+            out1.allowed,
+            "first call should be allowed: {:?}",
+            out1.error
+        );
+
+        let mut state2 = AppState::fail_closed().with_store(store);
+        state2.config = state2.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        state2.config.runtime_hooks.enable_rate_limit_state = true;
+        state2.config.rate_limits.per_token_call_limit = Some(2);
+        state2.prepare_runtime_hooks().await.unwrap();
+
+        let tracker = state2.rate_tracker.as_ref().expect("tracker restored");
+        assert_eq!(
+            tracker.token_total_calls(&base_req().token.revocation_id.0),
+            1
+        );
+
+        let (out2, _) = state2.handle_and_persist_audit(&base_req()).await;
+        assert!(out2.allowed, "second call after restart should be allowed");
+        let (out3, _) = state2.handle_and_persist_audit(&base_req()).await;
+        assert!(
+            !out3.allowed,
+            "third call should be denied by restored counter"
+        );
+        assert!(matches!(
+            out3.error,
+            Some(crate::lifecycle::GatewayError::BudgetOrRateLimited(_))
+        ));
+    }
+
     #[test]
     fn dispatch_mcp_stdio_decode_failure_is_fail_closed_and_clears_session() {
         let mut state = AppState::fail_closed();
@@ -1433,6 +1566,17 @@ sys.stdin.readline()
         ) -> store::StoreResult<store::ToolPinRecord> {
             Ok(record)
         }
+        async fn save_rate_limit_snapshot(
+            &self,
+            snapshot: store::RateLimitSnapshotRecord,
+        ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+            Ok(snapshot)
+        }
+        async fn load_rate_limit_snapshot(
+            &self,
+        ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+            Ok(None)
+        }
         async fn health_check(&self) -> store::StoreResult<()> {
             Ok(())
         }
@@ -1585,6 +1729,17 @@ sys.stdin.readline()
                 record: store::ToolPinRecord,
             ) -> store::StoreResult<store::ToolPinRecord> {
                 Ok(record)
+            }
+            async fn save_rate_limit_snapshot(
+                &self,
+                snapshot: store::RateLimitSnapshotRecord,
+            ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+                Ok(snapshot)
+            }
+            async fn load_rate_limit_snapshot(
+                &self,
+            ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+                Ok(None)
             }
             async fn health_check(&self) -> store::StoreResult<()> {
                 Ok(())

@@ -2525,6 +2525,17 @@ mod tests {
         ) -> store::StoreResult<store::ToolPinRecord> {
             Ok(record)
         }
+        async fn save_rate_limit_snapshot(
+            &self,
+            snapshot: store::RateLimitSnapshotRecord,
+        ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+            Ok(snapshot)
+        }
+        async fn load_rate_limit_snapshot(
+            &self,
+        ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+            Ok(None)
+        }
         async fn health_check(&self) -> store::StoreResult<()> {
             Ok(())
         }
@@ -2854,6 +2865,17 @@ mod tests {
             ) -> store::StoreResult<store::ToolPinRecord> {
                 Ok(record)
             }
+            async fn save_rate_limit_snapshot(
+                &self,
+                snapshot: store::RateLimitSnapshotRecord,
+            ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+                Ok(snapshot)
+            }
+            async fn load_rate_limit_snapshot(
+                &self,
+            ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+                Ok(None)
+            }
             async fn health_check(&self) -> store::StoreResult<()> {
                 Ok(())
             }
@@ -3105,6 +3127,17 @@ mod tests {
                 record: store::ToolPinRecord,
             ) -> store::StoreResult<store::ToolPinRecord> {
                 Ok(record)
+            }
+            async fn save_rate_limit_snapshot(
+                &self,
+                snapshot: store::RateLimitSnapshotRecord,
+            ) -> store::StoreResult<store::RateLimitSnapshotRecord> {
+                Ok(snapshot)
+            }
+            async fn load_rate_limit_snapshot(
+                &self,
+            ) -> store::StoreResult<Option<store::RateLimitSnapshotRecord>> {
+                Ok(None)
             }
             async fn health_check(&self) -> store::StoreResult<()> {
                 Ok(())
