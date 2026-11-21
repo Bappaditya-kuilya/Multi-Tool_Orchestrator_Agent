@@ -2,13 +2,13 @@
 
 > Operational skeleton aligned to current scaffold state and PRD intent. **Iteration:** M0/M6/M7/M8 prep loop (2026-11-17).
 > **Important:** many interfaces/behaviors below are **planned** (not implemented). Default safety intent is **fail closed** on audit store/policy/token errors.
-> **Blockers:** real deps/integrations and runtime wiring remain incomplete; do not claim operational readiness. Current verified baseline (2026-11-17): fmt pass, clippy pass, tests pass, bench 38p/7xf, dashboard build pass (capture reproducible evidence/logs for each run).
+> **Blockers:** real deps/integrations and runtime wiring remain incomplete; do not claim operational readiness. Current verified baseline (2026-11-17): fmt pass, clippy pass, tests pass, bench 38p/7xf, dashboard build pass (capture reproducible evidence/logs for each run). Gateway supports optional SQLite store wiring via config/env (`[gateway].store_backend`/`database_url`, `GATEWAY_STORE_BACKEND`/`GATEWAY_STORE_URL`/`DATABASE_URL` etc., default in-memory) with fail-closed init/connect/migrate errors. Implemented HTTP surfaces include ops, tasks (list/create/get/revoke), approvals (list/get/create/resolve), audit query/verify, policies, stream, and MCP dispatch (limited methods/tools); behavior depends on store/runtime wiring and remains not production-proven.
 
 ## 1. Service overview
 
 - **Service:** ScopeGate (least-privilege MCP gateway for AI agents)
 - **Primary interfaces (planned):** MCP endpoint (`/mcp`), Admin API (`/v1/*`), Ops (`/healthz`, `/readyz`, `/metrics`)
-- **Current runtime reality:** Rust crates with partial runtime wiring. `gateway` now includes an axum HTTP server/binary with ops/admin/MCP-dispatch routes and in-memory store wiring by default, but enforcement is incomplete (no real Biscuit/Cedar/`rmcp` full runtime, limited broker/secret handling, no proven durable append-before-return path, limited MCP tool execution). Do not treat as production-operable.
+- **Current runtime reality:** Rust crates with partial runtime wiring. `gateway` includes an axum HTTP server/binary with ops/admin/MCP-dispatch routes and in-memory store wiring by default; optional SQLite (WAL/sqlx) store wiring is supported via config/env with fail-closed init/connect/migrate errors. Task/approval/audit/policy/stream handlers are wired to store/lifecycle components in part, but enforcement remains incomplete (no real Biscuit/Cedar/`rmcp` full runtime, limited broker/secret live-path integration despite broker primitives, no production secret adapters/guarantees, durable append-before-return/runtime guarantees not fully proven end-to-end, limited MCP tool execution). Do not treat as production-operable.
 - **Key dependencies (target):** store, events, upstream MCP servers, secret sources
   - **S1:** SQLite WAL + in-process events (single node)
   - **S2:** Postgres + Redis streams (N stateless nodes, HA)
@@ -21,7 +21,8 @@
 - **Events/approvals:** in-process (tokio broadcast) in target design; no cross-node delivery.
 - **Topology:** one instance (no horizontal scale/LB). Suitable for local dev/demo/small-team validation.
 - **Safety intent:** fail closed on audit/store/policy/token errors; audit durability/integrity are safety-critical.
-- **Current state:** documented in Docker/compose skeletons; S1 runtime path **not implemented/validated**.
+- **Current state:** documented in Docker/compose skeletons; optional SQLite store wiring exists, but S1 runtime path **not fully implemented/validated**.
+- **Evidence capture (dev/local, best-effort):** `./e2e/capture_live_evidence.sh` (or `E2E_SQLITE=1 E2E_API_FLOW=1 E2E_MCP_FLOW=1 E2E_BENCH_LIVE=1 E2E_BENCH_MODES=all ./e2e/demo_flow.sh`) can start a managed sqlite gateway flow, exercise tasks/approvals/audit query+verify/MCP checks, and capture per-mode bench artifacts (`baseline|dryrun|enforce`) plus `evidence-manifest.json` when a live gateway is available. Treat outputs as environment-dependent evidence; not S1 validation/sign-off. See `e2e/README.md`.
 
 ### 2.2 S2 — stateless nodes behind load balancer (HA, target)
 
@@ -79,11 +80,11 @@
 - **S2 target:** approvals/events coordinated via store + Redis streams.
 - **Current primitive:** broker approval status models timeout-as-deny; no approval service/persistence.
 
-### 4.4 Audit (planned)
+### 4.4 Audit (planned/current)
 - Query/export audit records; correlate by audit seq/trace IDs.
-- Verify hash chain (`audit verify` / API endpoint when implemented).
+- `GET /v1/audit/verify` is available for store-backed hash-chain verification (fails closed on unavailable store or invalid chain per config/fail-closed behavior).
 - Audit append should be durable before returning tool results in normal path.
-- **Current primitives:** `core::audit` FNV-1a hash-chain append/verify (non-cryptographic) and `store` in-memory append/verify skeleton; **not durable and not wired to runtime path**.
+- **Current primitives/state:** `core::audit` FNV-1a hash-chain append/verify (non-cryptographic, in core) plus `store` hash-chained audit append/verify for in-memory and SQLite-backed stores; optional SQLite gateway wiring exists, but end-to-end durable append-before-return guarantees and persisted/runtime verification evidence are not fully proven.
 
 ## 5. Monitoring and alerts (M6 planned)
 
@@ -137,7 +138,7 @@
 
 ## 9. Known gaps (operational)
 
-- Gateway HTTP/admin/MCP-dispatch routes exist, but enforcement is partial: no real Biscuit/Cedar/`rmcp` full runtime, limited upstream execution/pool/front wiring, no production broker secret handling, and durability/append-before-return guarantees not proven.
+- Gateway HTTP/admin/MCP-dispatch routes exist, but enforcement is partial: no real Biscuit/Cedar/`rmcp` full runtime, limited upstream execution/pool/front wiring, limited broker/secret live-path integration (broker crate primitives exist; no production adapters/guarantees), and durability/append-before-return guarantees not fully proven (optional SQLite store wiring and store-backed `GET /v1/audit/verify` exist).
 - No S1/S2 runtime validation, backup/restore drills, alerting, or on-call/escalation process finalized.
 - Config/policy schemas and runtime loaders are not finalized/validated; observability/rate-limit/taint controls need hardening and evidence.
 
