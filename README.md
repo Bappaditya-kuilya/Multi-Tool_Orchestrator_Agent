@@ -1,84 +1,79 @@
-# ScopeGate
+# ScopeGate (S1 preview)
 
-Least-privilege MCP gateway for AI agents — Rust workspace scaffold with evolving runtime integrations.
+Least-privilege MCP gateway for AI agents (Rust workspace). **Preview, not production-ready; no security/release sign-off.**
 
-> **Status:** in active development, **not production-ready**.  
-> Current milestone: verified local baseline (fmt/clippy/tests/bench/dashboard build pass); core gateway/runtime integrations remain incomplete.
+> **Verification (current source, 2026-11-21):** `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all` **green**. Bench: **38 passed, 7 xfailed** (baseline; not live enforce-mode proof). Dashboard `npm run build` and SDK checks (`py_compile`, `tsc --noEmit`) **green**. Evidence, not sign-off.
+>
+> **Captured sqlite+stdio S1 proof:** [`e2e/logs/proof-s1-source-20261120T194149Z/`](e2e/logs/proof-s1-source-20261120T194149Z/) (`sqlite_wal`, stdio upstream demo; manifest `scopegate.e2e_evidence_manifest.v1`, commit `2e16912`). Shows managed runtime/API flow evidence including MCP allow, deny (fail-closed), approval pending-deny → approved-allow, and `/v1/audit/verify` (`ok:true`, `checked_events:14` in captured probe). Not S1/S2 validation or sign-off.
+>
+> **Captured sqlite+stdio restart evidence:** [`e2e/logs/proof-s1-source-restart-20261120T201236Z/`](e2e/logs/proof-s1-source-restart-20261120T201236Z/) (same sqlite_wal DB/config): pre-restart S1 flow + post-restart audit verify/continuity and task-state continuity captured. [`e2e/logs/smoke-scripts-restart-evidence/`](e2e/logs/smoke-scripts-restart-evidence/) provides additional two-phase restart smoke. Runtime endpoint evidence only; **not** full restart/durability/prod proof.
+>
+> **Evidence index:** [`e2e/FINAL_S1_EVIDENCE.md`](e2e/FINAL_S1_EVIDENCE.md).
 
-## Verified baseline (local)
+## Quickstart (local S1-style preview)
 
-- `cargo fmt --all --check` — pass
-- `cargo clippy --all-targets -- -D warnings` — pass
-- `cargo test --all` — pass
-- `python3 -m pytest bench -q` — **38 passed, 7 xfailed** (gateway/live-dependent cases expected without a configured live gateway)
-- `dashboard`: `npm run build` — pass
+**Prereqs:** Rust toolchain (`rust-toolchain.toml`), Python 3, Node/npm, optional `curl`.
 
-## What’s in this repo
-
-### Rust workspace (`crates/`)
-- **`core`** — token/scope/attenuation primitives, deny-by-default policy evaluation with reasons/obligations/hooks, audit hash-chain primitives (pluggable/default hashing), taint and rate/budget models, unit/integration tests.
-- **`gateway`** — axum-based HTTP server and lifecycle wiring: config loading, `/healthz`, `/readyz`, `/metrics`, `/v1/tasks`, `/v1/approvals`, `/v1/audit`, `/v1/policies`, `/v1/stream`, and `/mcp` JSON-RPC dispatch integration points with store/broker hooks and fail-closed behavior.
-- **`mcp-front`** — MCP front abstractions/handlers (JSON-RPC parsing/validation/shaping, auth/policy/taint/approval hooks, transport seams).
-- **`mcp-pool`** — upstream pool/client abstractions (connection lifecycle, dispatch/retry/timeout/circuit/health hooks, runtime seams).
-- **`broker`** — approval workflow, notification hooks, credential resolution/redaction/injection interfaces, store-persistence bridge hooks.
-- **`store`** — store trait/models, in-memory backend, SQLite/Postgres adapter scaffolding and migrations (including sqlite durable paths/tests), audit/query/verification helpers.
-
-### Tooling and interfaces
-- **`bench/`** — Python attack/behavior benchmark harness, scenarios, latency/reporting helpers, and CI-oriented outputs.
-- **`dashboard/`** — Vite + React + TypeScript admin UI scaffold with typed API client/SSE integration points and mock fallback behavior.
-- **`sdk/python`, `sdk/ts`** — SDK/client scaffolds oriented toward gateway API shapes.
-- **`scripts/`, `e2e/`, `docker/`, `policies/`, `.github/workflows/`** — local run/build/check scripts, e2e flow scaffolds, container/policy/config examples, and CI workflows.
-- **`reference/`** — archived legacy Python orchestrator implementation preserved for migration/reference.
-
-## Current gaps (not yet complete)
-
-- Real production integrations: **Biscuit** token crypto/attenuation, **Cedar** policy engine/schema loading, full **`rmcp`** front↔pool↔upstream runtime behavior.
-- Durable end-to-end runtime: fully wired/exercised **sqlx** SQLite/Postgres operations in live paths, restart-safe approval/state handling, cryptographic append-before-return audit persistence/export/verification.
-- Enforcement and evidence: live end-to-end fail-closed enforcement against a running gateway, enforce-mode/live benchmark artifacts, production-grade observability (OTel/metrics schemas), and runtime budget/taint/rate-limit enforcement coverage.
-- Product/release readiness: dashboard↔live gateway E2E verification, SDK integration tests/publish readiness, S1/S2 deployment validation and drills, hosted demo, hardening/sign-off, and versioned release artifacts.
-
-## Quick start
-
-### Prerequisites
-- Rust toolchain (see `rust-toolchain.toml`) with `cargo`, `rustfmt`, `clippy`
-- Python 3 (for `bench/`)
-- Node.js/npm (for `dashboard/`)
-
-### Build, lint, and test (Rust)
 ```bash
+# 1) Baseline checks
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+python3 -m pytest bench -q              # 38 passed, 7 xfailed in recent baseline (env/live-dependent)
+python3 -m py_compile sdk/python/src/scopegate_sdk/__init__.py
+cd dashboard && npm ci && npm run build && cd ..
+
+# 2) Run HTTP gateway with SQLite (preview)
+./scripts/run_sqlite_demo.sh
+# or: cargo build -p gateway && GATEWAY_STORE_BACKEND=sqlite_wal SCOPEGATE_DATABASE_URL=sqlite:///./.scopegate/scopegate.db cargo run -p gateway
+
+# 3) Basic probes (separate shell)
+curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:8080/readyz
+curl -s http://127.0.0.1:8080/metrics | head
+
+# 4) MCP stdio mode (preview)
+# GATEWAY_CONFIG=./scopegate.toml.example cargo run -p gateway -- --stdio
 ```
 
-### Run checks for other components
+Config/examples: `scopegate.toml.example`, `policies/examples/`. Dashboard: `VITE_API_BASE_URL=http://127.0.0.1:8080` (`dashboard/.env.example`), `npm run dev` (live API/SSE with fallback). SDKs: `sdk/python`, `sdk/ts` (preview HTTP/MCP clients).
+
+## Demo & evidence commands
+
 ```bash
-# Benchmark harness
-python3 -m pytest bench -q
+# Managed sqlite API/MCP/bench evidence capture (best-effort)
+./e2e/capture_live_evidence.sh
+# E2E_LOG_DIR=./e2e/logs/s1-evidence SCOPEGATE_CONFIG=./scopegate.toml.example ./e2e/capture_live_evidence.sh
+# E2E_SQLITE=1 E2E_API_FLOW=1 E2E_MCP_FLOW=1 E2E_BENCH_LIVE=1 E2E_BENCH_MODES=all ./e2e/demo_flow.sh
 
-# Dashboard
-cd dashboard && npm ci && npm run build
+# Sqlite+stdio live + restart evidence helper (captures phase1/phase2 artifacts)
+./scripts/run_sqlite_stdio_restart_evidence.sh
 ```
 
-### Gateway (scaffold/runtime wiring in progress)
-```bash
-# Build
-cargo build -p gateway
+Typical artifacts: `evidence-manifest.json` / `manifest.json`, API/MCP request-response/meta, gateway logs, audit verify probes, optional bench outputs under `E2E_LOG_DIR/bench/<mode>/`. Treat all artifacts as **evidence, not validation/sign-off**. See [`e2e/README.md`](e2e/README.md), [`docs/runbook.md`](docs/runbook.md).
 
-# Run (behavior/config depends on current implementation)
-cargo run -p gateway
-```
+## Status snapshot (preview)
 
-See `scopegate.toml.example`, `scripts/`, `e2e/`, and `docs/` for current run/e2e notes.
+- **Workspace:** `crates/{core,gateway,mcp-front,mcp-pool,broker,store}`. Axum gateway exposes ops/admin/MCP-dispatch routes (`/healthz`, `/readyz`, `/metrics`, `/v1/tasks*`, `/v1/approvals*`, `/v1/audit*`, `/v1/policies`, `/v1/stream`, `/mcp`) with fail-closed intent on key paths; not full `rmcp`/end-to-end upstream runtime.
+- **Store:** in-memory default; optional SQLite (WAL/sqlx) wiring with store-backed audit verification (`/v1/audit/verify`) in part. Captured sqlite+stdio proof/restart artifacts exist; durable end-to-end guarantees unproven.
+- **Bench/SDKs/dashboard:** 38p/7xf baseline harness; dashboard build + Python/TS static checks pass; clients/UI target evolving preview surfaces.
+- **Source of truth:** [`docs/STATUS.md`](docs/STATUS.md), [`docs/architecture.md`](docs/architecture.md), [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md).
+
+## Remaining gaps & limitations
+
+- **No sign-off / production readiness:** no security hardening sign-off, no complete S1/S2 runtime validation, no live authoritative enforce-mode proof, no hosted demo/release artifacts.
+- **Durability/restart not proven:** captured restart evidence is a persistence signal only; restart-safe approvals/state/revocation/budgets, append-before-return audit across all runtime paths, recovery semantics, and production store behavior remain unverified.
+- **Capability gaps (current source):** unresolved xfails/gaps include untrusted tool-output taint propagation to egress enforcement, concurrent cross-task isolation in live MCP handling, manifest/schema pinning/drift detection/re-approval, and agent-visible secret redaction/boundary enforcement.
+- **Incomplete runtime/security integrations:** real Biscuit verification/attenuation, Cedar policy engine/YAML compile-load, full `rmcp` front↔pool↔upstream execution, production secret broker/adapters/injection-redaction guarantees, cryptographic/durable audit across all paths, Postgres/Redis S2 path, hardened ops/observability/rate-limit/budget/taint enforcement.
+- **Non-goals (preview):** not an agent framework/LLM planner, not prompt-injection classification, not upstream MCP hosting, not multi-tenant SaaS/billing, not OS sandbox replacement, not broad non-MCP protocol support.
 
 ## Documentation
 
-- [`docs/STATUS.md`](docs/STATUS.md) — current implementation and verification snapshot
-- [`docs/architecture.md`](docs/architecture.md) — architecture and component mapping
-- [`docs/threat-model.md`](docs/threat-model.md) — threat model and control intent
-- [`docs/runbook.md`](docs/runbook.md) — operational notes
-- [`docs/migration.md`](docs/migration.md) — migration notes from legacy implementation
-- [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md) — readiness/evidence tracking
+- [`docs/STATUS.md`](docs/STATUS.md) — implementation & verification snapshot
+- [`docs/architecture.md`](docs/architecture.md) — component mapping & gaps
+- [`docs/runbook.md`](docs/runbook.md) — ops/evidence notes (preview)
+- [`docs/PRD.md`](docs/PRD.md) — target design (aspirational; drift applies)
+- [`docs/threat-model.md`](docs/threat-model.md), [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md), [`docs/migration.md`](docs/migration.md), [`docs/MIGRATION_MAP.md`](docs/MIGRATION_MAP.md)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md)
 
 ## License
