@@ -1,5 +1,8 @@
-# Example: read-only scope policy (scaffold / illustrative)
-# NOT validated against a finalized runtime schema/loader/enforcement path.
+# Example: read-only scope policy (illustrative / not runtime-loaded)
+# The current gateway config loader does NOT parse this YAML file.
+# For runtime-loaded rules today, use `[[rule]]` entries in scopegate.toml
+# (see runtime-rules.example.toml and scopegate.toml.example).
+#
 # Target semantics (aligned with core primitives): deny-by-default; Forbid overrides Permit;
 # risky/tainted actions may become RequireApproval once M2/M6 wiring lands.
 

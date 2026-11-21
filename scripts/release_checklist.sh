@@ -13,7 +13,7 @@ ScopeGate release checklist (M7/M8 prep)
 
 Current verified baseline (2026-11-17, capture fresh evidence/logs):
 - cargo fmt --all --check: PASS
-- cargo clippy --all-targets -- -D warnings: PASS
+- cargo clippy --all-targets --all-features -- -D warnings: PASS
 - cargo test --all: PASS
 - bench: 38 passed, 7 xfailed (record mode/commit/env/output)
 - dashboard build: PASS
@@ -21,7 +21,7 @@ Current verified baseline (2026-11-17, capture fresh evidence/logs):
 Build & quality (Rust toolchain required)
 - [ ] ./scripts/check_rust_toolchain.sh (and ./scripts/install_rust_toolchain.sh if needed)
 - [ ] cargo fmt --all --check
-- [ ] cargo clippy --all-targets -- -D warnings
+- [ ] cargo clippy --all-targets --all-features -- -D warnings
 - [ ] cargo check --all
 - [ ] cargo test --all
 - [ ] CI green (.github/workflows/rust-ci.yml, scaffold-checks.yml) with artifacts/logs

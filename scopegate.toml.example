@@ -1,87 +1,94 @@
-# ScopeGate configuration (example scaffold)
-# Copy to scopegate.toml and adjust for your environment.
-# IMPORTANT: illustrative only. Schema/loader/runtime enforcement are not finalized;
-# some fields may not be read by current gateway config loader yet.
-# Iteration M0/M6/M7/M8: config/docs alignment only. Real integrations remain blockers
-# (Biscuit/Cedar/full rmcp runtime/sqlx durable stores/secret adapters/crypto audit).
-
-[server]
-# Planned MCP/API bind settings (HTTP/MCP server not fully implemented).
-host = "127.0.0.1"
-port = 8080
-# admin_host = "127.0.0.1"
-# admin_port = 8081
-# request_timeout_ms = 30000
+# ScopeGate runtime configuration example (aligned to current gateway loader)
+#
+# Copy to `scopegate.toml` (or point GATEWAY_CONFIG at this file) and adjust.
+# Loader reads: [gateway], [[rule]], [mcp], [[mcp_upstream]].
+# Unknown sections/keys may be ignored by the current runtime loader; safe defaults
+# are fail-closed/deny-by-default. Production integrations remain incomplete
+# (Biscuit/Cedar/full rmcp runtime/persistent guarantees) — treat as preview config.
 
 [gateway]
-# Target: deny-by-default, fail-closed on policy/audit/store/token errors.
-default_decision = "deny"
-policies_path = "policies/examples"
-# fail_closed_on_policy_error = true
-# fail_closed_on_audit_error = true
-# max_request_body_bytes = 1048576
+# Runtime safety defaults.
+fail_closed = true
+require_token_scope_for_action = true
+# egress_policy: require_approval_on_conflict (default/fail-closed) | block_on_conflict
+egress_policy = "require_approval_on_conflict"
 
-[store]
-# S1 target: sqlite (WAL). S2 target: postgres.
-backend = "sqlite" # sqlite | postgres
-database_url = "sqlite:///data/scopegate.db"
-# migrate_on_start = false
+# Listen address for HTTP mode (env GATEWAY_ADDR overrides).
+listen_addr = "127.0.0.1:8080"
 
-[auth]
-# Planned: Biscuit token verification, key IDs/rotation, revocation/budget state.
-mode = "token" # planned
-# token_issuer = ""
-# token_audience = ""
-# jwks_or_public_keys_path = ""
+# S1/S2 preview store wiring (durable adapters; fail-closed on init/connect/migrate errors).
+# Env overrides: GATEWAY_STORE_BACKEND/SCOPEGATE_STORE_BACKEND and
+# GATEWAY_STORE_URL/GATEWAY_DATABASE_URL/SCOPEGATE_DATABASE_URL/DATABASE_URL.
+store_backend = "sqlite_wal" # memory|sqlite_wal|sqlite|postgres (sqlite/postgres runtime wiring present in preview; guarantees unproven)
+store_database_url = "sqlite://./.scopegate/scopegate.db"
 
-[approvals]
-# Planned: approval workflow (timeout defaults to deny).
-enabled = false
-# timeout_seconds = 300
-# persistence = "memory" # memory|sqlite|postgres (planned)
+# Runtime hooks (keep conservative defaults unless explicitly needed).
+persist_audit_events = false
+sync_revocations_from_store = false
+use_approval_store = false
+enable_rate_limit_state = true
+# rate_limit_per_token_call_limit = 0
+# rate_limit_per_token_budget = 0
 
-[observability]
-# Planned M6 surfaces/hooks: /healthz, /readyz, /metrics, tracing/OTel.
-health_enabled = false
-ready_enabled = false
-metrics_enabled = false
-tracing_enabled = false
-# metrics_path = "/metrics"
-# log_format = "json"
+# Optional static revocations (token IDs), comma-separated in env GATEWAY_REVOKED_TOKEN_IDS.
+# revoked_token_ids = []
 
-[limits]
-# Planned M6 hooks: per-token/principal/upstream budgets and rate limits.
-enabled = false
-# default_max_calls_per_task = 0
-# requests_per_minute = 0
+# Minimal demo-safe rules (explicit permits; everything else denied/fails closed).
+# gateway main also injects a small default set only when no rules are loaded.
+[[rule]]
+principal = "agent"
+action = "tool.invoke"
+resource = "tool"
+decision = "permit"
 
-[taint]
-# Planned M6 hooks: label propagation and taint-aware egress enforcement.
-enabled = false
-# block_conflicted_external_egress = true
+[[rule]]
+principal = "anonymous"
+action = "tools/list"
+resource = "tools/list"
+decision = "permit"
 
-[broker]
-# Planned: secret resolution/injection/redaction adapters (env/file/vault/etc.).
-enabled = false
-# adapter = "env"
+[[rule]]
+principal = "anonymous"
+action = "tools/call"
+resource = "gateway.health"
+decision = "permit"
 
-[audit]
-# Planned: durable hash-chained append-before-return (current core/store are non-crypto/in-memory scaffolds).
-enabled = true
-mode = "scaffold" # scaffold | durable (planned)
-# hash = "fnv1a-placeholder" # target: cryptographic
-# path = "./audit.jsonl"
+[[rule]]
+principal = "anonymous"
+action = "tools/call"
+resource = "tools/call"
+decision = "permit"
 
-[dashboard]
-# Vite+React+TS scaffold under dashboard/ (build verified; no backend integration).
-enabled = false
-# host = "127.0.0.1"
-# port = 3000
+[mcp]
+# HTTP server mode by default; set to "stdio" for MCP stdio serving.
+mode = "http"
+# default_upstream = "demo-upstream"
 
-# [[upstreams]]
-# name = "example"
-# kind = "mcp-stdio" # planned
-# command = "..."
-# args = []
-# env = {}
-# allowed_tools = []
+# Real upstream wiring (runtime-read). Configure at least one upstream for pool dispatch.
+# You can also wire a single upstream via env:
+#   GATEWAY_MCP_UPSTREAM_URL=https://...        (http)
+#   GATEWAY_MCP_UPSTREAM_CMD=/path/to/server   (stdio) + GATEWAY_MCP_UPSTREAM_ARGS="..."
+#   GATEWAY_MCP_UPSTREAM_ID=demo-upstream
+#
+# Example: stdio MCP upstream (replace program/args with a real MCP server command).
+# [[mcp_upstream]]
+# id = "demo-upstream"
+# transport = "stdio"
+# program = "node"
+# args = ["./path/to/mcp-server.js"]
+# # cwd = "."
+# # max_leases = 1
+# # max_retries = 0
+# # [mcp_upstream.env]
+# # EXAMPLE_TOKEN = "replace-me"
+#
+# Example: HTTP MCP upstream.
+# [[mcp_upstream]]
+# id = "demo-http"
+# transport = "http"
+# endpoint = "http://127.0.0.1:9000/mcp"
+# # max_leases = 4
+# # max_retries = 1
+# # [mcp_upstream.headers]
+# # Authorization = "Bearer replace-me"
+

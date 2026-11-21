@@ -1,0 +1,29 @@
+# Runtime-aligned rule examples for current gateway config loader.
+# Copy relevant [[rule]] blocks into scopegate.toml (or another GATEWAY_CONFIG file).
+# Loader fields: principal, action, resource, decision (permit|forbid|require_approval).
+# Evaluation is deny-by-default in core; Forbid overrides Permit.
+
+[[rule]]
+principal = "agent"
+action = "tool.invoke"
+resource = "tool"
+decision = "permit"
+
+[[rule]]
+principal = "anonymous"
+action = "tools/list"
+resource = "tools/list"
+decision = "permit"
+
+[[rule]]
+principal = "anonymous"
+action = "tools/call"
+resource = "gateway.health"
+decision = "permit"
+
+# Deny-by-default applies to unmatched requests. Add explicit Forbid rules for clarity where needed.
+# [[rule]]
+# principal = "*"
+# action = "tools/call"
+# resource = "admin.*"
+# decision = "forbid"
