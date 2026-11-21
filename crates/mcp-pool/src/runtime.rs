@@ -281,9 +281,16 @@ mod imp {
             let payload = if let Some(r) = resp.get("result") {
                 serde_json::to_string(r).unwrap_or_else(|_| r.to_string())
             } else if let Some(e) = resp.get("error") {
-                return Err(PoolError::DispatchFailed(e.to_string()));
+                if !e.is_null() {
+                    return Err(PoolError::DispatchFailed(e.to_string()));
+                }
+                return Err(PoolError::DispatchFailed(
+                    "upstream response missing result/error".into(),
+                ));
             } else {
-                resp.to_string()
+                return Err(PoolError::DispatchFailed(
+                    "upstream response missing result/error".into(),
+                ));
             };
             Ok(ForwardResponse { payload })
         }

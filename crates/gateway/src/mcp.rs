@@ -813,10 +813,15 @@ fn dispatch_error_to_jsonrpc(e: &str) -> (i64, String) {
         || e.contains("timeout after")
     {
         (-32002, "MCP upstream unavailable (fail-closed)".to_string())
-    } else if e.starts_with("upstream_response_parse_failed") || e.starts_with("upstream_error:") {
+    } else if e.starts_with("upstream_response_parse_failed") {
         (
             -32000,
             "MCP upstream response invalid (fail-closed)".to_string(),
+        )
+    } else if e.starts_with("upstream_error:") {
+        (
+            -32000,
+            "MCP upstream returned error (fail-closed)".to_string(),
         )
     } else {
         // pool_dispatch_failed and other dispatch failures share the same fail-closed response.
@@ -827,10 +832,18 @@ fn dispatch_error_to_jsonrpc(e: &str) -> (i64, String) {
 fn extract_upstream_result(payload: &str) -> Result<Value, String> {
     let v = serde_json::from_str::<Value>(payload)
         .map_err(|e| format!("upstream_response_parse_failed:{e}"))?;
-    if let Some(err) = v.get("error") {
-        return Err(format!("upstream_error:{err}"));
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "upstream_response_parse_failed:not_object".to_string())?;
+    if let Some(err) = obj.get("error") {
+        if !err.is_null() {
+            return Err(format!("upstream_error:{err}"));
+        }
     }
-    Ok(v.get("result").cloned().unwrap_or(v))
+    if let Some(result) = obj.get("result") {
+        return Ok(result.clone());
+    }
+    Err("upstream_response_parse_failed:missing_result".to_string())
 }
 
 fn selected_upstream_id(state: &AppState, req_upstream: Option<&str>) -> Option<String> {
@@ -1568,7 +1581,8 @@ pub async fn handle_mcp_request_async_with_context(
         }
         "ping" => Ok(json!({})),
         "tools/list" => {
-            // Preserve local capability surface when no upstream; proxy to upstream when configured.
+            // Preserve local capability surface when no upstream is configured; fail closed on
+            // upstream anomalies/invalid responses when an upstream is selected.
             let upstream_available = stdio_transport_for_request(state, req.upstream.as_deref())
                 .is_some()
                 || state.has_mcp_runtime().await;
@@ -1587,32 +1601,8 @@ pub async fn handle_mcp_request_async_with_context(
                 )
                 .await
                 {
-                    Ok(payload) => match extract_upstream_result(&payload) {
-                        Ok(r) => Ok(r),
-                        Err(e) if e.starts_with("upstream_error:") => Err(e),
-                        Err(_) => {
-                            emit(
-                                state,
-                                "mcp.upstream.fallback",
-                                "tools/list local capability surface",
-                                task_id.clone(),
-                            );
-                            Ok(
-                                json!({"tools":[{"name":"gateway.health","description":"Gateway MCP dispatch health probe","inputSchema":{"type":"object"}}]}),
-                            )
-                        }
-                    },
-                    Err(_) => {
-                        emit(
-                            state,
-                            "mcp.upstream.fallback",
-                            "tools/list local capability surface",
-                            task_id.clone(),
-                        );
-                        Ok(
-                            json!({"tools":[{"name":"gateway.health","description":"Gateway MCP dispatch health probe","inputSchema":{"type":"object"}}]}),
-                        )
-                    }
+                    Ok(payload) => extract_upstream_result(&payload),
+                    Err(e) => Err(e),
                 }
             } else {
                 Ok(
@@ -2691,6 +2681,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_list_allow_fails_closed_when_audit_append_fails() {
+        let store: Arc<dyn store::Store> = Arc::new(FailingAuditStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":44,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Audit append failed"));
+        assert!(
+            state
+                .metrics
+                .audit_append_failures
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_task_context_deny_fails_closed_when_audit_append_fails() {
+        let store: Arc<dyn store::Store> = Arc::new(FailingAuditStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({
+                "jsonrpc":"2.0","id":45,"method":"tools/list",
+                "params":{"task_id":"missing-task"}
+            })
+            .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Audit append failed"));
+    }
+
+    #[tokio::test]
+    async fn initialize_allow_fails_closed_when_audit_append_fails() {
+        let store: Arc<dyn store::Store> = Arc::new(FailingAuditStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":46,"method":"initialize","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Audit append failed"));
+    }
+
+    #[tokio::test]
+    async fn initialized_notification_denied_path_fails_closed_when_audit_append_fails() {
+        // "initialized" is not an exempt/special-cased method; with no upstream configured it
+        // follows the unknown-method deny path and must still fail closed on audit append failure.
+        let store: Arc<dyn store::Store> = Arc::new(FailingAuditStore);
+        let mut state = AppState::fail_closed().with_store(store);
+        state.config = permit_all_config();
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":47,"method":"initialized","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Audit append failed"));
+    }
+
+    #[tokio::test]
     async fn restart_durable_store_context_allows_and_appends_audit() {
         let store: Arc<dyn store::Store> = Arc::new(InMemoryStore::default());
         store
@@ -3398,6 +3484,100 @@ mod tests {
             !resp_b.payload_json.contains("task-a"),
             "cross-task context leaked into response: {}",
             resp_b.payload_json
+        );
+    }
+
+    #[test]
+    fn extract_upstream_result_rejects_malformed_shapes_fail_closed() {
+        for (label, payload) in [
+            ("not-object", "[]"),
+            ("missing-result-and-error", r#"{"jsonrpc":"2.0","id":1}"#),
+            (
+                "null-error-no-result",
+                r#"{"jsonrpc":"2.0","id":1,"error":null}"#,
+            ),
+            ("invalid-json", "not-json"),
+        ] {
+            let err = extract_upstream_result(payload).expect_err(label);
+            assert!(
+                err.starts_with("upstream_response_parse_failed:"),
+                "{label}: {err}"
+            );
+        }
+
+        let err = extract_upstream_result(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#,
+        )
+        .expect_err("upstream error");
+        assert!(err.starts_with("upstream_error:"), "{err}");
+
+        let ok = extract_upstream_result(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#)
+            .expect("result");
+        assert_eq!(ok, json!({"tools":[]}));
+    }
+
+    #[tokio::test]
+    async fn tools_list_upstream_invalid_response_fails_closed_no_fallback() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let server = mcp_pool::UpstreamServerConfig::with_stdio(
+            "bad",
+            "python3",
+            vec!["-c".into(), "print('not-json')".into()],
+        );
+        state.config.mcp_upstreams = vec![crate::config::McpUpstreamConfig {
+            server,
+            pool: mcp_pool::UpstreamConfig::default(),
+        }];
+        state.config.mcp_default_upstream = Some("bad".into());
+
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":220,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert_eq!(
+            v["error"]["message"],
+            "MCP upstream response invalid (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_upstream_missing_result_fails_closed_no_fallback() {
+        let mut state = state_with_store();
+        state.config = permit_all_config();
+        let server = mcp_pool::UpstreamServerConfig::with_stdio(
+            "bad-shape",
+            "python3",
+            vec![
+                "-c".into(),
+                "print('{\"jsonrpc\":\"2.0\",\"id\":1}')".into(),
+            ],
+        );
+        state.config.mcp_upstreams = vec![crate::config::McpUpstreamConfig {
+            server,
+            pool: mcp_pool::UpstreamConfig::default(),
+        }];
+        state.config.mcp_default_upstream = Some("bad-shape".into());
+
+        let req = McpRequest {
+            method: String::new(),
+            payload_json: json!({"jsonrpc":"2.0","id":221,"method":"tools/list","params":{}})
+                .to_string(),
+            upstream: None,
+        };
+        let resp = handle_mcp_request_async(&state, req).await;
+        assert!(resp.fail_closed, "{}", resp.payload_json);
+        let v: Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(v["error"]["code"], -32000);
+        assert_eq!(
+            v["error"]["message"],
+            "MCP upstream response invalid (fail-closed)"
         );
     }
 }

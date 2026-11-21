@@ -939,7 +939,9 @@ fn extract_json_result_or_error(json: &str) -> Result<String, PoolError> {
     if let Some(result) = extract_json_field_value(json, "result") {
         return Ok(result);
     }
-    Ok(json.trim().to_string())
+    Err(PoolError::DispatchFailed(
+        "upstream response missing result/error".into(),
+    ))
 }
 
 fn build_stdio_request_line(request: &ForwardRequest, id: i64) -> Result<String, PoolError> {

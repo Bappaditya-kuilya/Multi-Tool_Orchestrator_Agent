@@ -669,18 +669,59 @@ pub async fn handle_v1_task_revoke(
         target_id: existing.id.clone(),
         reason: reason.clone(),
         revoked_at: req.now.unwrap_or_else(now_unix).to_string(),
-        revoked_by: req.revoked_by,
+        revoked_by: req.revoked_by.clone(),
     };
+    let revoked_at_ts = rec.revoked_at.clone();
+    let revocation_id_for_audit = rec.id.clone();
+    let revoked_by_for_audit = rec.revoked_by.clone().unwrap_or_default();
     if let Err(e) = store.record_revocation(rec).await {
         return map_store_err(e);
     }
 
     let mut task = existing;
     task.revoked = true;
-    task.revocation_reason = reason.or(task.revocation_reason);
+    task.revocation_reason = reason.clone().or(task.revocation_reason);
     if let Err(e) = store.upsert_task(task.clone()).await {
         return map_store_err(e);
     }
+
+    // Append-before-return: durable audit for task revocation. Fail closed on append failure.
+    let audit = AuditEvent {
+        seq: 0,
+        ts: revoked_at_ts,
+        task_id: Some(task.id.clone()),
+        tool: Some("task.revoke".to_string()),
+        decision: "revoked".to_string(),
+        reason: reason.clone(),
+        args_digest: Some(scopegate_core::audit::digest(&format!(
+            "revocation_id={};revoked_by={}",
+            revocation_id_for_audit, revoked_by_for_audit
+        ))),
+        result_digest: Some(scopegate_core::audit::digest(&format!(
+            "revoked={};task_id={}",
+            task.revoked, task.id
+        ))),
+        prev_hash: None,
+        hash: None,
+    };
+    match store.append_audit_event(audit).await {
+        Ok(_) => {
+            state
+                .metrics
+                .audit_appends
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e) => {
+            state
+                .metrics
+                .audit_append_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if state.config.fail_closed {
+                return ApiResponse::unavailable(format!("audit append failed (fail-closed): {e}"));
+            }
+        }
+    }
+
     ApiResponse::ok(task)
 }
 
@@ -896,6 +937,44 @@ pub async fn handle_v1_approvals(
                 .lock()
                 .expect("approvals lock")
                 .resolve(&req.id, decision, now);
+            let audit = AuditEvent {
+                seq: 0,
+                ts: now.to_string(),
+                task_id: Some(r.task_id.clone()),
+                tool: Some("approval.resolve".to_string()),
+                decision: format!("{:?}", r.status).to_lowercase(),
+                reason: req.reason.clone(),
+                args_digest: Some(scopegate_core::audit::digest(&format!(
+                    "approval_id={};principal={}",
+                    r.id,
+                    req.principal.as_deref().unwrap_or("")
+                ))),
+                result_digest: Some(scopegate_core::audit::digest(&format!(
+                    "status={:?};task_id={}",
+                    r.status, r.task_id
+                ))),
+                prev_hash: None,
+                hash: None,
+            };
+            match store.append_audit_event(audit).await {
+                Ok(_) => {
+                    state
+                        .metrics
+                        .audit_appends
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    state
+                        .metrics
+                        .audit_append_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if state.config.fail_closed {
+                        return ApiResponse::unavailable(format!(
+                            "audit append failed (fail-closed): {e}"
+                        ));
+                    }
+                }
+            }
             state.emit_event(crate::state::StreamEvent {
                 kind: "approval.resolved".into(),
                 message: format!("{}:{:?}", r.id, r.status),
@@ -1107,13 +1186,52 @@ pub async fn handle_v1_policies(
             active: req.active.unwrap_or(true),
         };
         match store.upsert_policy(record).await {
-            Ok(p) => ApiResponse::ok(PolicyView {
-                id: p.id,
-                active: p.active,
-                version: Some(p.version),
-                created_at: Some(p.created_at),
-                body: serde_json::from_str(&p.body).ok(),
-            }),
+            Ok(p) => {
+                let audit = AuditEvent {
+                    seq: 0,
+                    ts: p.created_at.clone(),
+                    task_id: None,
+                    tool: Some("policy.upsert".to_string()),
+                    decision: "upserted".to_string(),
+                    reason: Some(format!("version={};active={}", p.version, p.active)),
+                    args_digest: Some(scopegate_core::audit::digest(&format!(
+                        "policy_id={};version={}",
+                        p.id, p.version
+                    ))),
+                    result_digest: Some(scopegate_core::audit::digest(&format!(
+                        "active={};id={}",
+                        p.active, p.id
+                    ))),
+                    prev_hash: None,
+                    hash: None,
+                };
+                match store.append_audit_event(audit).await {
+                    Ok(_) => {
+                        state
+                            .metrics
+                            .audit_appends
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        state
+                            .metrics
+                            .audit_append_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if state.config.fail_closed {
+                            return ApiResponse::unavailable(format!(
+                                "audit append failed (fail-closed): {e}"
+                            ));
+                        }
+                    }
+                }
+                ApiResponse::ok(PolicyView {
+                    id: p.id,
+                    active: p.active,
+                    version: Some(p.version),
+                    created_at: Some(p.created_at),
+                    body: serde_json::from_str(&p.body).ok(),
+                })
+            }
             Err(e) => map_store_err(e),
         }
     } else {
