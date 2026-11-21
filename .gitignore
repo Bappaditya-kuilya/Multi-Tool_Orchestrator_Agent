@@ -47,3 +47,6 @@ data/
 .vscode/
 *.swp
 *.swo
+# Local generated artifacts
+/.scopegate/
+/graphify-out/

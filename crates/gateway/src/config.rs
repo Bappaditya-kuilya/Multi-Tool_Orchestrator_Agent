@@ -275,14 +275,6 @@ fn parse_store_selection(s: &str) -> StoreSelection {
     }
 }
 
-#[allow(dead_code)]
-fn parse_store_backend(s: &str) -> StoreBackend {
-    match parse_store_selection(s) {
-        StoreSelection::SqliteWal | StoreSelection::Postgres => StoreBackend::SqliteWal,
-        StoreSelection::InMemory => StoreBackend::InMemory,
-    }
-}
-
 fn upstream_from_section(sec: &McpUpstreamSection) -> Option<McpUpstreamConfig> {
     let mut map = BTreeMap::new();
     let transport = sec.transport.clone().unwrap_or_else(|| {
