@@ -352,6 +352,10 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub events_tx: broadcast::Sender<String>,
     pub mcp: Option<McpRuntime>,
+    /// Tracks whether in-memory rate/budget counters changed since last durable snapshot persist.
+    /// Sync handle paths mutate counters but cannot await persistence; callers should use
+    /// `handle_and_persist_audit` or `persist_rate_limit_snapshot_if_dirty` when durability is required.
+    pub(crate) rate_limit_snapshot_dirty: bool,
 }
 
 impl Default for AppState {
@@ -372,6 +376,7 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             events_tx,
             mcp: None,
+            rate_limit_snapshot_dirty: false,
         }
     }
 
@@ -407,6 +412,7 @@ impl AppState {
     pub fn configure_rate_limit_state(&mut self) {
         if !self.config.runtime_hooks.enable_rate_limit_state {
             self.rate_tracker = None;
+            self.rate_limit_snapshot_dirty = false;
             return;
         }
         if self.rate_tracker.is_some() {
@@ -419,6 +425,7 @@ impl AppState {
             || limits.per_token_budget.is_some();
         if configured {
             self.rate_tracker = Some(InMemoryRateLimitTracker::new(limits));
+            self.rate_limit_snapshot_dirty = false;
         }
     }
 
@@ -571,9 +578,15 @@ impl AppState {
     }
 
     /// Load persisted rate/budget counters into the in-memory tracker.
-    /// Fail-closed on store read/deserialize errors when rate-limit state is enabled with a store.
+    /// Fail-closed on store read/deserialize errors when persistence is enabled with a store.
+    ///
+    /// Config-drift semantics: restored counters are applied as-is; current configured limits are
+    /// enforced on subsequent checks. If limits changed across restart, restored counts may be
+    /// evaluated against the new limits (intentional, fail-closed toward enforcement).
     pub async fn load_rate_limit_snapshot_from_store(&mut self) -> Result<bool, String> {
-        if !self.config.runtime_hooks.enable_rate_limit_state {
+        if !self.config.runtime_hooks.enable_rate_limit_state
+            || !self.config.runtime_hooks.persist_rate_limit_state
+        {
             return Ok(false);
         }
         let Some(store) = &self.store else {
@@ -595,16 +608,22 @@ impl AppState {
             return Ok(false);
         };
         tracker.restore_snapshot(snapshot);
+        self.rate_limit_snapshot_dirty = false;
         Ok(true)
     }
 
     /// Persist current rate/budget counters for restart-safe recovery.
-    /// Fail-closed on serialize/store errors when rate-limit state is enabled with a store.
-    pub async fn persist_rate_limit_snapshot_to_store(&self) -> Result<bool, String> {
-        if !self.config.runtime_hooks.enable_rate_limit_state {
+    /// Fail-closed on serialize/store errors when persistence is enabled with a store.
+    /// shortcut: writes a full global snapshot (no batching/checkpoint); callers that need lower
+    /// overhead should batch at a higher layer while preserving fail-closed semantics.
+    pub async fn persist_rate_limit_snapshot_to_store(&mut self) -> Result<bool, String> {
+        if !self.config.runtime_hooks.enable_rate_limit_state
+            || !self.config.runtime_hooks.persist_rate_limit_state
+        {
+            self.rate_limit_snapshot_dirty = false;
             return Ok(false);
         }
-        let Some(store) = &self.store else {
+        let Some(store) = self.store.clone() else {
             return Ok(false);
         };
         let Some(tracker) = &self.rate_tracker else {
@@ -624,7 +643,17 @@ impl AppState {
             .save_rate_limit_snapshot(rec)
             .await
             .map_err(|e| format!("rate limit snapshot save failed (fail-closed): {e}"))?;
+        self.rate_limit_snapshot_dirty = false;
         Ok(true)
+    }
+
+    /// Persist rate/budget snapshot only when in-memory counters changed since last persist.
+    /// This is the explicit async helper for sync handle paths that cannot await persistence.
+    pub async fn persist_rate_limit_snapshot_if_dirty(&mut self) -> Result<bool, String> {
+        if !self.rate_limit_snapshot_dirty {
+            return Ok(false);
+        }
+        self.persist_rate_limit_snapshot_to_store().await
     }
 
     /// Apply configured durable hooks before handling (sync-revocations/rate-limit/approval state).
@@ -801,6 +830,9 @@ impl AppState {
     }
 
     /// Execute request lifecycle using integrated abstractions.
+    ///
+    /// Note: sync path; rate/budget counter mutations are not durably persisted here.
+    /// Use `handle_and_persist_audit` or `persist_rate_limit_snapshot_if_dirty` for restart safety.
     pub fn handle(&mut self, req: &InboundRequest) -> GatewayOutcome {
         let (out, _audit_log) = self.handle_with_audit_log(req);
         out
@@ -808,10 +840,15 @@ impl AppState {
 
     /// Execute request lifecycle and return the in-memory audit log for durable/store-backed hooks.
     /// Preserves existing lifecycle behavior and fail-closed semantics.
+    ///
+    /// Note: mutates in-memory rate/budget counters but cannot persist them (sync path). For
+    /// durable restart safety, prefer `handle_and_persist_audit` or call
+    /// `persist_rate_limit_snapshot_if_dirty` after this method in async contexts.
     pub fn handle_with_audit_log(
         &mut self,
         req: &InboundRequest,
     ) -> (GatewayOutcome, Vec<AuditEntry>) {
+        let rate_mut_before = self.rate_tracker.as_ref().map(|t| t.mutation_count());
         let (out, audit_log) = match self.rate_tracker.as_mut() {
             Some(tracker) => handle_request_with_hooks_and_log(
                 req,
@@ -821,6 +858,15 @@ impl AppState {
             ),
             None => handle_request_with_hooks_and_log(req, &self.config, &mut self.approvals, None),
         };
+        if let Some(before) = rate_mut_before {
+            if self
+                .rate_tracker
+                .as_ref()
+                .is_some_and(|t| t.mutation_count() != before)
+            {
+                self.rate_limit_snapshot_dirty = true;
+            }
+        }
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         if out.allowed {
             self.metrics
@@ -886,8 +932,8 @@ impl AppState {
                 return (audit_persistence_denied(&audit_log, e), audit_log);
             }
         }
-        if self.config.runtime_hooks.enable_rate_limit_state && self.store.is_some() {
-            if let Err(e) = self.persist_rate_limit_snapshot_to_store().await {
+        if self.rate_limit_snapshot_dirty {
+            if let Err(e) = self.persist_rate_limit_snapshot_if_dirty().await {
                 if out.allowed {
                     self.metrics
                         .requests_allowed
@@ -1363,6 +1409,88 @@ for line in sys.stdin:
             out3.error,
             Some(crate::lifecycle::GatewayError::BudgetOrRateLimited(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_snapshot_config_drift_applies_new_limits_to_restored_counts() {
+        let store = Arc::new(InMemoryStore::default()) as Arc<dyn Store>;
+        let mut state1 = AppState::fail_closed().with_store(store.clone());
+        state1.config = state1.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        state1.config.runtime_hooks.enable_rate_limit_state = true;
+        state1.config.runtime_hooks.persist_rate_limit_state = true;
+        state1.config.rate_limits.per_token_call_limit = Some(2);
+        state1.prepare_runtime_hooks().await.unwrap();
+        let (out1, _) = state1.handle_and_persist_audit(&base_req()).await;
+        assert!(out1.allowed);
+
+        // Restart with stricter limit: restored count=1 should be evaluated against new limit=1.
+        let mut state2 = AppState::fail_closed().with_store(store);
+        state2.config = state2.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        state2.config.runtime_hooks.enable_rate_limit_state = true;
+        state2.config.runtime_hooks.persist_rate_limit_state = true;
+        state2.config.rate_limits.per_token_call_limit = Some(1);
+        state2.prepare_runtime_hooks().await.unwrap();
+        let (out2, _) = state2.handle_and_persist_audit(&base_req()).await;
+        assert!(
+            !out2.allowed,
+            "restored count should be enforced against new stricter limit"
+        );
+        assert!(matches!(
+            out2.error,
+            Some(crate::lifecycle::GatewayError::BudgetOrRateLimited(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_handle_path_marks_dirty_and_explicit_persist_recovers() {
+        let store = Arc::new(InMemoryStore::default()) as Arc<dyn Store>;
+        let mut state = AppState::fail_closed().with_store(store.clone());
+        state.config = state.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        state.config.runtime_hooks.enable_rate_limit_state = true;
+        state.config.runtime_hooks.persist_rate_limit_state = true;
+        state.config.rate_limits.per_token_call_limit = Some(2);
+        state.prepare_runtime_hooks().await.unwrap();
+
+        let (out, _) = state.handle_with_audit_log(&base_req());
+        assert!(out.allowed);
+        assert!(
+            state.rate_limit_snapshot_dirty,
+            "sync handle should mark rate snapshot dirty"
+        );
+        let persisted = state.persist_rate_limit_snapshot_if_dirty().await.unwrap();
+        assert!(persisted);
+
+        let mut restarted = AppState::fail_closed().with_store(store);
+        restarted.config = restarted.config.clone().with_rules(vec![Rule::exact(
+            "agent",
+            "tool.invoke",
+            "tool",
+            PolicyDecision::Permit,
+        )]);
+        restarted.config.runtime_hooks.enable_rate_limit_state = true;
+        restarted.config.runtime_hooks.persist_rate_limit_state = true;
+        restarted.config.rate_limits.per_token_call_limit = Some(2);
+        restarted.prepare_runtime_hooks().await.unwrap();
+        let tracker = restarted.rate_tracker.as_ref().expect("tracker restored");
+        assert_eq!(
+            tracker.token_total_calls(&base_req().token.revocation_id.0),
+            1
+        );
     }
 
     #[test]

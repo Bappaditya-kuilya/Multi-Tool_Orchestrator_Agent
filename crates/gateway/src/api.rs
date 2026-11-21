@@ -491,7 +491,33 @@ pub async fn handle_v1_tasks(
         Err(e) => return map_store_err(e),
     }
 
-    let out = state.handle(&inbound);
+    let mut out = state.handle(&inbound);
+    if out.allowed {
+        if let Err(e) = state.persist_rate_limit_snapshot_if_dirty().await {
+            state
+                .metrics
+                .requests_allowed
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .requests_denied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            out = crate::lifecycle::runtime_integration_denied(
+                &[],
+                crate::lifecycle::Stage::BudgetRateLimit,
+                format!("rate limit snapshot persistence failed (fail-closed): {e}"),
+            );
+        }
+    } else {
+        // Still persist consumed counters on denied outcomes when dirty; fail-closed on error.
+        if let Err(e) = state.persist_rate_limit_snapshot_if_dirty().await {
+            out = crate::lifecycle::runtime_integration_denied(
+                &[],
+                crate::lifecycle::Stage::BudgetRateLimit,
+                format!("rate limit snapshot persistence failed (fail-closed): {e}"),
+            );
+        }
+    }
     let stage = format!("{:?}", out.stage);
     let state_str = if out.allowed { "allowed" } else { "denied" };
 

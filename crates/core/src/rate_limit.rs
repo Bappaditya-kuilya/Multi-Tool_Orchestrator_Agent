@@ -132,6 +132,7 @@ struct TokenState {
 pub struct InMemoryRateLimitTracker {
     limits: Limits,
     tokens: HashMap<String, TokenState>,
+    mutation_count: u64,
 }
 
 impl InMemoryRateLimitTracker {
@@ -139,7 +140,14 @@ impl InMemoryRateLimitTracker {
         Self {
             limits,
             tokens: HashMap::new(),
+            mutation_count: 0,
         }
+    }
+
+    /// Monotonic counter bumped on mutating operations (consume/restore). Used by gateway to
+    /// detect whether a sync handle path dirtied counters and needs durable snapshot persistence.
+    pub fn mutation_count(&self) -> u64 {
+        self.mutation_count
     }
 
     pub fn limits(&self) -> &Limits {
@@ -180,8 +188,11 @@ impl InMemoryRateLimitTracker {
     }
 
     /// Restore counter state from a persisted snapshot. Replaces existing token counters.
+    /// Note: config-drift semantics are owned by the caller/gateway: restored counters are kept
+    /// and evaluated against currently configured limits on subsequent checks.
     pub fn restore_snapshot(&mut self, snapshot: RateLimitTrackerSnapshot) {
         self.tokens.clear();
+        self.mutation_count = self.mutation_count.saturating_add(1);
         for (k, v) in snapshot.tokens {
             self.tokens.insert(
                 k,
@@ -394,6 +405,7 @@ impl InMemoryRateLimitTracker {
         }
 
         state.budget_used = state.budget_used.saturating_add(budget_units);
+        self.mutation_count = self.mutation_count.saturating_add(1);
         decision
     }
 

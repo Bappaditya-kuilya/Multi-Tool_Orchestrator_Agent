@@ -59,6 +59,10 @@ pub struct RuntimeIntegrationHooks {
     pub use_approval_store: bool,
     /// Enable in-memory rate-limit/budget tracker state when limits are configured.
     pub enable_rate_limit_state: bool,
+    /// Persist rate/budget tracker snapshots to durable store when rate-limit state is enabled.
+    /// Defaults to true for backward-compatible fail-closed restart behavior; set false to keep
+    /// rate-limit state in-memory only (no restart recovery).
+    pub persist_rate_limit_state: bool,
     /// Enable broker credential injection in lifecycle when secret refs are present.
     pub enable_broker_injection: bool,
 }
@@ -70,6 +74,7 @@ impl Default for RuntimeIntegrationHooks {
             sync_revocations_from_store: false,
             use_approval_store: false,
             enable_rate_limit_state: true,
+            persist_rate_limit_state: true,
             enable_broker_injection: true,
         }
     }
@@ -195,6 +200,7 @@ struct GatewaySection {
     sync_revocations_from_store: Option<bool>,
     use_approval_store: Option<bool>,
     enable_rate_limit_state: Option<bool>,
+    persist_rate_limit_state: Option<bool>,
     enable_broker_injection: Option<bool>,
     rate_limit_per_token_call_limit: Option<u32>,
     rate_limit_per_token_budget: Option<u64>,
@@ -446,6 +452,9 @@ fn apply_env(mut cfg: GatewayConfig, file_explicit_hooks: ExplicitRuntimeHooks) 
     if let Ok(v) = std::env::var("GATEWAY_ENABLE_RATE_LIMIT_STATE") {
         cfg.runtime_hooks.enable_rate_limit_state = env_truthy(&v);
     }
+    if let Ok(v) = std::env::var("GATEWAY_PERSIST_RATE_LIMIT_STATE") {
+        cfg.runtime_hooks.persist_rate_limit_state = env_truthy(&v);
+    }
     if let Ok(v) = std::env::var("GATEWAY_ENABLE_BROKER_INJECTION") {
         cfg.runtime_hooks.enable_broker_injection = env_truthy(&v);
     }
@@ -568,6 +577,9 @@ fn parse_gateway_config_inner(source: &str) -> (GatewayConfig, ExplicitRuntimeHo
     if let Some(v) = parsed.gateway.enable_rate_limit_state {
         cfg.runtime_hooks.enable_rate_limit_state = v;
     }
+    if let Some(v) = parsed.gateway.persist_rate_limit_state {
+        cfg.runtime_hooks.persist_rate_limit_state = v;
+    }
     if let Some(v) = parsed.gateway.enable_broker_injection {
         cfg.runtime_hooks.enable_broker_injection = v;
     }
@@ -687,6 +699,7 @@ rate_limit_per_token_budget = 42
         assert!(cfg.runtime_hooks.sync_revocations_from_store);
         assert!(cfg.runtime_hooks.use_approval_store);
         assert!(!cfg.runtime_hooks.enable_rate_limit_state);
+        assert!(cfg.runtime_hooks.persist_rate_limit_state);
         assert!(cfg.runtime_hooks.enable_broker_injection);
         assert_eq!(cfg.rate_limits.per_token_call_limit, Some(7));
         assert_eq!(cfg.rate_limits.per_token_budget, Some(42));
@@ -835,6 +848,7 @@ database_url = "sqlite://./.scopegate/s1.db"
         assert!(!cfg.runtime_hooks.sync_revocations_from_store);
         assert!(!cfg.runtime_hooks.use_approval_store);
         assert!(cfg.runtime_hooks.enable_rate_limit_state);
+        assert!(cfg.runtime_hooks.persist_rate_limit_state);
         assert!(cfg.runtime_hooks.enable_broker_injection);
     }
 

@@ -736,7 +736,7 @@ async fn validate_token_auth(
     Ok(())
 }
 
-fn apply_rate_tracker(
+async fn apply_rate_tracker(
     state: &mut AppState,
     token_key: &str,
     action: &str,
@@ -744,10 +744,28 @@ fn apply_rate_tracker(
     units: u64,
 ) -> Result<(), String> {
     state.configure_rate_limit_state();
-    let Some(tracker) = state.rate_tracker.as_mut() else {
-        return Ok(());
+    let rate_mut_before = state.rate_tracker.as_ref().map(|t| t.mutation_count());
+    let decision = {
+        let Some(tracker) = state.rate_tracker.as_mut() else {
+            return Ok(());
+        };
+        tracker.consume(token_key, action, now, units)
     };
-    let decision = tracker.consume(token_key, action, now, units);
+    let mutated = rate_mut_before
+        .zip(state.rate_tracker.as_ref().map(|t| t.mutation_count()))
+        .is_some_and(|(b, a)| a != b);
+    if mutated {
+        state.rate_limit_snapshot_dirty = true;
+        if state.config.runtime_hooks.enable_rate_limit_state
+            && state.config.runtime_hooks.persist_rate_limit_state
+            && state.store.is_some()
+        {
+            state
+                .persist_rate_limit_snapshot_to_store()
+                .await
+                .map_err(|e| format!("rate_limit_snapshot_persist_failed:{e}"))?;
+        }
+    }
     if decision.is_allowed() {
         Ok(())
     } else if decision.reasons.is_empty() {
@@ -1219,7 +1237,7 @@ pub async fn handle_mcp_request_async_with_context(
     if let Some(tok) = &provided_token {
         let token_key = tok.revocation_id.0.clone();
         let units = budget_hint.as_ref().map(|b| b.used.min(1)).unwrap_or(0);
-        if let Err(reason) = apply_rate_tracker(state, &token_key, &action, now, units) {
+        if let Err(reason) = apply_rate_tracker(state, &token_key, &action, now, units).await {
             emit(
                 state,
                 "mcp.denied",
