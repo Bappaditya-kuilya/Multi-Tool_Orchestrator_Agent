@@ -12,6 +12,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Script syntax checks (lightweight)
+        run: bash -n scripts/*.sh
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -45,3 +48,26 @@ jobs:
       - name: Build dashboard
         working-directory: dashboard
         run: npm run build
+
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python SDK compile check
+        run: python3 -m py_compile sdk/python/src/scopegate_sdk/__init__.py
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: TypeScript SDK typecheck
+        working-directory: sdk/ts
+        run: npx --yes -p typescript tsc -p tsconfig.json --noEmit

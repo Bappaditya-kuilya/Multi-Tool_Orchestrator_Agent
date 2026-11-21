@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
-# ScopeGate gateway Dockerfile (scaffold/prep for real cargo builds)
+# ScopeGate gateway Dockerfile (SQLite S1 preview / best-effort build)
 # Tries to build the `gateway` crate; falls back to a placeholder binary so the
 # image remains buildable while runtime targets/wiring are incomplete.
+# Runtime store/upstream envs (gateway/config defaults preserved if unset):
+#   GATEWAY_CONFIG=/app/scopegate.toml
+#   GATEWAY_ADDR=0.0.0.0:8080
+#   GATEWAY_STORE_BACKEND=sqlite_wal|sqlite|inmemory (and SCOPEGATE_* aliases)
+#   GATEWAY_DATABASE_URL=sqlite:///data/scopegate.db (and SCOPEGATE_*/DATABASE_URL aliases)
+#   GATEWAY_MCP_UPSTREAM_URL|GATEWAY_MCP_UPSTREAM_CMD(+ARGS/ID) for real upstream wiring
 
 # Keep aligned with rust-toolchain.toml when practical.
 ARG RUST_VERSION=1.77
@@ -28,7 +34,7 @@ RUN set -eux; \
     elif [ -x /workspace/target/release/scopegate-gateway ]; then \
       cp /workspace/target/release/scopegate-gateway /workspace/target/release/scopegate-gateway-bin; \
     else \
-      printf '%s\n' '#!/bin/sh' 'echo "ScopeGate gateway placeholder (runtime not fully implemented)"' 'echo "Set SCOPEGATE_CONFIG/SCOPEGATE_BIND_ADDR/RUST_LOG and rebuild when gateway target is ready."' 'exec sleep infinity' > /workspace/target/release/scopegate-gateway-bin; \
+      printf '%s\n' '#!/bin/sh' 'echo "ScopeGate gateway placeholder (runtime not fully implemented)"' 'echo "Set GATEWAY_CONFIG/GATEWAY_ADDR/RUST_LOG and rebuild when gateway target is ready."' 'exec sleep infinity' > /workspace/target/release/scopegate-gateway-bin; \
       chmod +x /workspace/target/release/scopegate-gateway-bin; \
     fi
 
@@ -42,13 +48,17 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /workspace/target/release/scopegate-gateway-bin /usr/local/bin/scopegate-gateway
 COPY --from=builder /workspace/scopegate.toml.example /app/scopegate.toml
+RUN mkdir -p /data && chown scopegate:scopegate /data /app
 
-ENV SCOPEGATE_BIND_ADDR=0.0.0.0:8080 \
+ENV GATEWAY_CONFIG=/app/scopegate.toml \
     SCOPEGATE_CONFIG=/app/scopegate.toml \
+    GATEWAY_ADDR=0.0.0.0:8080 \
+    SCOPEGATE_BIND_ADDR=0.0.0.0:8080 \
     RUST_LOG=info
 
 EXPOSE 8080
 # Admin/ops ports may be split later when implemented.
+VOLUME ["/data"]
 
 USER scopegate
 ENTRYPOINT ["/usr/local/bin/scopegate-gateway"]
