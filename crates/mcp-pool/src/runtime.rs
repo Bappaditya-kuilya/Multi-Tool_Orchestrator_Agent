@@ -485,16 +485,15 @@ mod imp {
         }
 
         pub async fn disconnect(&mut self, upstream: &UpstreamId) -> Result<(), PoolError> {
-            let (sess, slot_state) = {
+            let sess = {
                 let slot = self
                     .upstreams
                     .get_mut(upstream)
                     .ok_or_else(|| PoolError::UnknownUpstream(upstream.0.clone()))?;
                 slot.state = ConnectionState::Disconnected;
                 slot.healthy = false;
-                (slot.session.take(), ())
+                slot.session.take()
             };
-            let _ = slot_state;
             if let Some(s) = sess {
                 if let Ok(s) = Arc::try_unwrap(s) {
                     let _ = self.manager.disconnect(s.into_inner()).await;
