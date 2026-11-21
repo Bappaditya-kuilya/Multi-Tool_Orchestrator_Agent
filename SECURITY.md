@@ -1,25 +1,18 @@
 # Security Policy
 
-**Status:** Draft. ScopeGate is currently a scaffold/partial implementation snapshot; many security controls described in docs are planned unless explicitly noted as implemented and verified.
+**Status (preview):** ScopeGate is an S1 preview / partial implementation. Do **not** treat this repository as production-hardened or security-audited. Many controls in docs/PRD are planned or non-production substitutes.
 
-## Reporting a vulnerability
+## Reporting a vulnerability (factual posture)
 
-- **Do not** open a public issue with exploit details.
-- **Private reporting channel:** TBD (no finalized private intake yet). Until established, contact maintainers through a private repository communication channel if available and share a clear description, impact, affected components, and reproduction steps.
-- Please avoid including secrets, credentials, or sensitive data in reports.
-
-We will acknowledge reports and coordinate remediation/disclosure timelines once the process and contacts are finalized.
+- **Do not** open a public issue with exploit details or sensitive reproduction data.
+- **Private reporting channel:** not yet finalized/TBD. If you have access to a private maintainer contact or repository-private channel, report there with: affected component/commit, impact, reproduction steps, and any suggested mitigation. Avoid sharing secrets or personal data.
+- **Acknowledgement/SLA/disclosure timeline:** not established yet (pre-release). We will coordinate in good faith when a report is received through an available private channel.
+- **Supported releases/patch policy:** none yet (pre-release; no supported release line).
 
 ## Current security posture (important)
 
-- **Not production-ready.** Many security-critical controls remain incomplete or non-production substitutes.
-- **Implemented now (partial):** `crates/core` primitives (token attenuation/expiry/budget/revocation-ID placeholders, deny-by-default policy eval with forbid overrides, FNV-1a non-cryptographic audit chain, coarse taint decisions) with unit tests; `crates/gateway` exposes axum HTTP routes (`/healthz,/readyz,/metrics,/v1/tasks,/v1/audit,/v1/approvals,/v1/policies,/v1/stream,/mcp` minimal dispatch) with in-memory store wiring by default. These are not equivalent to production-grade enforcement.
-- **Current verified baseline (2026-11-17):** `cargo fmt --all --check` pass, `cargo clippy --all-targets -- -D warnings` pass, `cargo test --all` pass, bench 38 passed/7 xfailed, dashboard build pass. This is not a security sign-off.
-- **Known gaps/blockers:** real Biscuit crypto verification/attenuation and Cedar policy engine/YAML compile-load; full `rmcp` runtime and upstream front/pool execution; broker secret adapters/injection/redaction guarantees; durable SQLx-backed append-before-return audit with cryptographic chain and persisted verification; restart-safe approvals/state; enforced rate-limit/budget/taint propagation and egress controls; production observability/tracing schemas; end-to-end fail-closed/live enforcement evidence, S1/S2 validation, hosted demo, and v0.1.0 sign-off. No live hosted demo in this snapshot.
+- **Not production-ready / no sign-off:** no cryptographic audit, no live enforce-mode proof, no S1/S2 runtime validation, no hosted demo, no release hardening sign-off.
+- **Partial implementations (non-production substitutes):** core token/policy/taint primitives and non-cryptographic (FNV-1a) audit-chain primitives; gateway axum routes (`/healthz,/readyz,/metrics,/v1/tasks* ,/v1/approvals* ,/v1/audit* ,/v1/policies,/v1/stream,/mcp`) with in-memory default and optional SQLite wiring in places; minimal MCP dispatch and store-backed audit verification paths exist but are not proven as durable/complete end-to-end enforcement.
+- **Known gaps/blockers:** real Biscuit verification/attenuation, Cedar engine/YAML compile-load, full `rmcp` front↔pool↔upstream runtime, gateway live-path credential injection/scrubbing integration and production secret broker/adapters with end-to-end guarantees, durable append-before-return cryptographic audit and persisted verification, restart-safe approvals/state, enforced rate-limit/budget/taint propagation/egress controls, production observability schemas, and validated fail-closed behavior across all runtime paths.
 
-## Supported versions / disclosure
-
-- Versioning and supported release lines: TBD (pre-release).
-- Disclosure target policy: TBD (coordinated disclosure goal; process not finalized).
-
-See `docs/threat-model.md`, `docs/architecture.md`, and `docs/STATUS.md` for explicit limits, planned controls, and verification state.
+For factual limits and current evidence, see [`docs/threat-model.md`](docs/threat-model.md), [`docs/STATUS.md`](docs/STATUS.md), and [`docs/architecture.md`](docs/architecture.md). For target intent vs implementation drift, see [`docs/PRD.md`](docs/PRD.md) and [`README.md`](README.md).

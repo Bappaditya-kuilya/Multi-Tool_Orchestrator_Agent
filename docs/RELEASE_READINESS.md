@@ -1,48 +1,33 @@
-# ScopeGate — Release Readiness Notes
+# ScopeGate — Release Readiness (fast final update)
 
-> Factual readiness snapshot for M0/M6/M7/M8 iteration prep. Updated: 2026-11-17. This is **not** a release sign-off.
+> Factual snapshot for M0/M6/M7/M8 gates. Updated: 2026-11-21. **Not a release sign-off.**
+>
+> **Evidence index:** [`e2e/FINAL_S1_EVIDENCE.md`](../e2e/FINAL_S1_EVIDENCE.md).
 
-## Intended release gates (target, PRD-aligned)
+## S1 / S2 / M8 gate status (concise)
 
-- CI green (fmt/clippy/check/tests) on a Rust-toolchain environment.
-- End-to-end S1 path validated with fail-closed behavior on audit/store/policy/token errors.
-- Durable, verifiable audit chain (append-before-return) with `audit verify` evidence.
-- Bench baseline and enforce-mode results against a live gateway (attack classes measurable, artifacts published with mode/commit/env).
-- Ops surfaces and drills: `/healthz`, `/readyz`, `/metrics`, tracing/rate-limit/taint hooks as applicable, backup/restore, rollback criteria exercised.
-- Docs/SDK/config/policies consistent with implemented behavior; security review recorded.
+| Gate | Status | Captured evidence (local, env-dependent) | Gaps / why not met |
+|------|--------|-------------------------------------------|--------------------|
+| **S1** (single node, SQLite WAL, fail-closed, durable append-before-return audit + verify, restart-safe approvals/state/revocation/budget) | **Partial evidence, not validated/signed off** | `e2e/logs/manual-live-s1/evidence-manifest.json` (`scopegate.manual_live_s1_evidence.v1`, 2026-11-20): sqlite WAL gateway, policy deny (`demo.forbidden`), approval create/approve + pending-deny validation, audit query/verify captured; bench **41 passed, 4 xfailed, 0 failed** for `baseline|dryrun|enforce` (live managed). `e2e/logs/proof-s1-source-manual2/api_flow/23_audit_verify_get.json`: `ok:true`, `checked_events:5` (in-run). `e2e/logs/proof-s1-source-20261120T194149Z/` and `e2e/logs/proof-s1-source-restart-20261120T201236Z/` (`scopegate.e2e_evidence_manifest.v1`): sqlite_wal S1 allow/deny/approval/audit-verify artifacts; 201236Z adds post-restart audit verify/continuity and task-state continuity (runtime endpoint evidence; 194149Z/201236Z `demo_flow.summary.log` note `gateway_help_probe:124`). `e2e/logs/smoke-scripts-restart-evidence/manifest.json`: phase1/phase2 restart smoke captures. | No reproducible S1 sign-off bundle; no proven restart-safe/persisted-state behavior across *all* paths/process scenarios; no comprehensive fail-closed proof for audit/store/policy/token error classes; no durable append-before-return/crypto audit proof; upstream/runtime capability caveats remain; capability-gated bench xfails remain. |
+| **S2** (Postgres + Redis streams, shared approvals/audit/events, HA/degraded-mode, migration/backup/restore/rollback drills) | **Not started / no evidence** | None captured. | No multi-node runtime, no shared-state validation, no HA/degraded-mode or drill evidence. |
+| **M8** (reproducible green CI, live enforce-mode bundle, end-to-end validated enforcement/runtime, hardened ops/observability, security sign-off, hosted demo, versioned v0.1.0 artifacts/checksums) | **Not met** | Partial/subset checks only (2026-11-21): `cargo fmt -p broker` + `cargo test -p broker` (**32 passed**), dashboard `npm run build`, Python SDK `py_compile`, TS SDK `tsc --noEmit`. Prior reported baseline (2026-11-17, not rerun this pass): Rust fmt/clippy/tests pass; bench **38p/7xf**. | No reproducible CI/release bundle, no live wired enforce-mode proof, no validated end-to-end enforcement path, no security review/sign-off, no hosted demo, no release artifacts/checksums. |
 
-## Current evidence (2026-11-17, verified green baseline)
+## Blockers (exact, release-critical)
 
-| Area | Status | Evidence / notes |
-|------|--------|------------------|
-| Rust fmt | **Pass** | `cargo fmt --all --check` clean. |
-| Rust clippy | **Pass** | `cargo clippy --all-targets -- -D warnings` clean. |
-| Rust tests | **Pass** | `cargo test --all` all pass. |
-| `crates/core` primitives | **Implemented (scaffold substitutes)** | Token/policy/audit (FNV-1a, non-crypto)/taint primitives + unit tests; runtime enforcement integration incomplete. |
-| Gateway HTTP/MCP-dispatch | **Partial** | Axum server/routes (`/healthz,/readyz,/metrics,/v1/tasks,/v1/audit,/v1/approvals,/v1/policies,/v1/stream,/mcp`) and in-memory store wiring exist; minimal MCP methods/tools only, no full `rmcp`/upstream execution, no production auth/enforcement. |
-| Bench (M4) | **Partial evidence** | **38 passed, 7 xfailed** (record mode/commit/logs). Not enforce-mode/live enforcement proof against fully wired gateway. |
-| Dashboard (M5 scaffold) | **Build pass** | Vite build succeeds; UI static/non-integrated. |
-| Docker/compose | **Scaffold/prep** | Cargo-oriented build/run scaffolds with fallback placeholder behavior possible; not production-ready. |
-| E2E/scripts | **Working prep scripts** | `e2e/demo_flow.sh`, `scripts/*` run real cargo/gateway/bench steps where possible with overrides and log capture; results depend on environment/runtime completeness. |
-| Audit (runtime durability) | **Not ready** | FNV-1a chain primitives and in-memory wiring exist; no cryptographic/durable append-before-return or persisted runtime verification. |
-| Ops/limits/taint hooks (M6) | **Partial** | Basic health/ready/metrics/stream surfaces exist; tracing/OTel, enforced limits/taint, stable schemas incomplete. |
-| S1/S2 validation (M7) | **Not done** | No runtime validation, HA/degraded-mode, or backup/restore drills. |
-| SDKs | **HTTP clients (scaffold)** | Python/TS clients call current gateway APIs/MCP dispatch; no auth attenuation flows, integration tests, or publish workflow. |
-| Security hardening/sign-off | **Not done** | No formal review or production security guarantees. |
-| Hosted demo / v0.1.0 | **Not done** | No live hosted demo and no release artifacts/sign-off. |
+- **Runtime/security deps not production-complete:** Biscuit verification/attenuation, Cedar engine + YAML compile/load, full `rmcp` runtime/front-pool/upstream execution, production secret broker/adapters with injection/redaction guarantees, complete approvals/runtime behavior.
+- **Durability/audit not proven:** end-to-end fail-closed store lifecycle, durable append-before-return audit, persisted/restart verification, cryptographic hashing/signing/anchoring, restart-safe approvals/task/revocation/budgets.
+- **M6 hardening incomplete:** production tracing/OTel, stable observability schemas, enforced rate-limit/budget/taint propagation/egress hooks with auditable outcomes.
+- **Evidence gaps:** dashboard/SDK/live E2E integration against wired enforcement paths unverified; bench xfails/capability gaps unresolved for sign-off; no enforce-mode/live benchmark bundle suitable for release.
+- **Ops/release gaps:** no complete S1 validation bundle, no S2 validation/drills, no backup/restore/rollback evidence, no hosted demo, no security sign-off, no versioned artifacts/checksums.
 
-## Blockers to M8 readiness (exact)
+## What remains for production/release readiness
 
-- **Real deps/runtime wiring:** Biscuit token verification/attenuation, Cedar policy engine + YAML compile/load, full `rmcp` MCP runtime/front-pool/upstream execution, secret broker/adapters with injection/redaction guarantees, approvals persistence/service.
-- **Durable runtime path:** SQLx-backed stores and end-to-end fail-closed lifecycle with cryptographic, durable append-before-return audit and persisted verification; restart-safe state/revocation/budgets.
-- **M6 hardening:** production tracing/OTel and stable observability schemas; enforced rate-limit/budget and taint propagation/egress hooks with auditable outcomes.
-- **Integration/evidence:** bench/dashboard/SDKs validated against live, wired enforcement paths with enforce-mode artifacts (including 38p/7xf reproduction details and environment).
-- **M7/M8 ops/release:** S1/S2 runtime validation, backup/restore, rollback drills, incident/runbook evidence, hosted demo, security hardening/sign-off, and versioned v0.1.0 release artifacts.
+1. **Close S1:** produce reproducible sqlite-WAL validation proving fail-closed on audit/store/policy/token error classes, durable append-before-return audit + `GET /v1/audit/verify` across restart/persisted state, and restart-safe approvals/task/revocation/budgets (captured logs/manifests, commit/env).
+2. **Close S2:** validate Postgres + Redis streams multi-node behavior (shared approvals/audit/events, HA/degraded-mode) and complete migration/backup/restore/rollback drills with evidence.
+3. **Harden runtime:** replace placeholder security/runtime components, wire full MCP/broker/enforcement paths, and prove end-to-end fail-closed behavior.
+4. **Harden ops/observability:** stable schemas, tracing/OTel, enforced limits/taint/egress controls, and auditable failure outcomes.
+5. **M8 release package:** reproducible CI-green baseline, live enforce-mode bench bundle against wired gateway (xfails explained), verified dashboard/SDK integrations, security review/sign-off, hosted demo proof, and versioned v0.1.0 artifacts/checksums. **No sign-off claimed.**
 
 ## References
-
-- [`STATUS.md`](./STATUS.md) — milestone and verification truth
-- [`runbook.md`](./runbook.md) — planned operations, rollback, e2e/CI notes
-- [`threat-model.md`](./threat-model.md) — controls and explicit limits
-- [`../scripts/RELEASE_CHECKLIST.md`](../scripts/RELEASE_CHECKLIST.md), [`../e2e/README.md`](../e2e/README.md) — prep/evidence artifacts
-- [`.github/workflows/rust-ci.yml`](../.github/workflows/rust-ci.yml), [`.github/workflows/scaffold-checks.yml`](../.github/workflows/scaffold-checks.yml) — CI checks
+- [`STATUS.md`](./STATUS.md), [`runbook.md`](./runbook.md), [`threat-model.md`](./threat-model.md)
+- [`../scripts/RELEASE_CHECKLIST.md`](../scripts/RELEASE_CHECKLIST.md), [`../e2e/README.md`](../e2e/README.md)
