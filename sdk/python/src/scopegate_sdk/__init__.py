@@ -1,15 +1,14 @@
-"""ScopeGate Python SDK (HTTP client toward current gateway API).
+"""ScopeGate Python SDK (stdlib HTTP client for current ScopeGate preview APIs).
 
-Provides a small stdlib HTTP client for implemented/planned gateway surfaces:
-`/healthz`, `/readyz`, `/metrics`, `/v1/tasks`, `/v1/audit`, `/v1/approvals`,
-`/v1/policies`, and `/mcp` (JSON-RPC dispatch). This is an integration-oriented
-scaffold, not a hardened/complete production SDK.
+Covers implemented gateway surfaces where available: `/healthz`, `/readyz`,
+`/metrics`, `/v1/tasks` (list/create/get/revoke), `/v1/audit` (query),
+`/v1/audit/verify`, `/v1/approvals` (list/get/create/resolve), `/v1/policies`,
+`/v1/stream` (SSE endpoint helper/stream open), and `/mcp` (JSON-RPC dispatch).
 
-Factual state (2026-11-17): gateway has axum server wiring and in-memory/store-
-backed handlers; enforcement/runtime remains partial (no real Biscuit/Cedar/`rmcp`
-full runtime, limited auth/secret handling, durability semantics depend on store
-wiring). Treat responses as best-effort and verify behavior against current code.
-Track progress in docs/STATUS.md.
+Preview/scaffold: no real Biscuit/Cedar/full `rmcp` runtime, limited auth/secret
+handling, and durability/enforcement semantics are partial and not production-proven.
+Treat responses as best-effort envelopes and verify behavior against the running gateway.
+See docs/STATUS.md and README.md.
 """
 
 from __future__ import annotations
@@ -47,7 +46,10 @@ ENDPOINTS = {
     "ready": "/readyz",
     "metrics": "/metrics",
     "tasks": "/v1/tasks",
+    "task": "/v1/tasks/{id}",
+    "task_revoke": "/v1/tasks/{id}/revoke",
     "audit": "/v1/audit",
+    "audit_verify": "/v1/audit/verify",
     "approvals": "/v1/approvals",
     "policies": "/v1/policies",
     "stream": "/v1/stream",
@@ -55,7 +57,6 @@ ENDPOINTS = {
     # Planned/compat aliases
     "tool_call": "/mcp",
     "audit_query": "/v1/audit",
-    "audit_verify": "/v1/audit",
 }
 
 
@@ -153,7 +154,9 @@ class ToolsAPI(Protocol):
 
 @runtime_checkable
 class ApprovalsAPI(Protocol):
+    def list(self) -> Any: ...
     def get(self, approval_id: str) -> ApprovalRequest: ...
+    def create(self, payload: Mapping[str, Any]) -> Any: ...
     def resolve(self, approval_id: str, decision: str, reason: Optional[str] = None) -> ApprovalRequest: ...
 
 
@@ -278,15 +281,35 @@ class ScopeGateClient:
     def list_tasks(self) -> Any:
         return self.request("GET", self.endpoint("tasks"))
 
-    # MCP (JSON-RPC dispatch; limited methods supported by current gateway)
-    def mcp(self, method: str, params: Optional[Mapping[str, Any]] = None, req_id: Any = 1) -> Any:
-        payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    def get_task(self, task_id: str) -> Any:
+        return self.request("GET", self.endpoint("task", id=task_id))
+
+    def revoke_task(self, task_id: str, payload: Optional[Mapping[str, Any]] = None) -> Any:
+        return self.request(
+            "POST",
+            self.endpoint("task_revoke", id=task_id),
+            json_body=dict(payload) if payload is not None else None,
+        )
+
+    # MCP (JSON-RPC dispatch via gateway HTTP wrapper; limited methods/tools supported by current gateway)
+    def mcp(
+        self,
+        method: str,
+        params: Optional[Mapping[str, Any]] = None,
+        req_id: Any = 1,
+        upstream: Optional[str] = None,
+    ) -> Any:
+        rpc: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
-            payload["params"] = dict(params)
+            rpc["params"] = dict(params)
+        payload: Dict[str, Any] = {"payload_json": json.dumps(rpc)}
+        if upstream:
+            payload["upstream"] = upstream
         return self.request("POST", self.endpoint("mcp"), json_body=payload)
 
     # Approvals
     def create_approval(self, payload: Mapping[str, Any]) -> Any:
+        """Create/submit an approval record or decision payload (server contract may evolve)."""
         return self.request("POST", self.endpoint("approvals"), json_body=dict(payload))
 
     # Policies
@@ -295,6 +318,37 @@ class ScopeGateClient:
 
     def upsert_policy(self, payload: Mapping[str, Any]) -> Any:
         return self.request("POST", self.endpoint("policies"), json_body=dict(payload))
+
+    # Stream (SSE; best-effort). Caller is responsible for closing the returned response.
+    def stream(self, *, timeout_s: Optional[float] = None, headers: Optional[Mapping[str, str]] = None):
+        """Open GET /v1/stream and return the urllib response for SSE iteration.
+
+        Preview endpoint: event shapes may change. Use a long/no timeout for live streams.
+        """
+        url = self._url(self.endpoint("stream"))
+        req_headers: Dict[str, str] = {"Accept": "text/event-stream, application/json;q=0.9, */*;q=0.8"}
+        if self.token:
+            req_headers["Authorization"] = f"Bearer {self.token}"
+        req_headers.update(self.options.headers)
+        if headers:
+            req_headers.update(dict(headers))
+        req = urllib.request.Request(url, headers=req_headers, method="GET")
+        context = None
+        if url.startswith("https://") and not self.verify_tls:
+            context = ssl._create_unverified_context()
+        to = self.timeout_s if timeout_s is None else timeout_s
+        try:
+            return urllib.request.urlopen(req, timeout=to, context=context)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            body: Any
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else None
+            except Exception:
+                body = raw.decode("utf-8", errors="replace") if raw else None
+            raise ScopeGateHTTPError(e.code, e.reason, body=body, url=url) from None
+        except urllib.error.URLError as e:
+            raise ScopeGateError(f"Request failed for {url}: {e}") from e
 
     def close(self) -> None:
         return None
@@ -323,17 +377,42 @@ class _HttpApprovals(ApprovalsAPI):
     def __init__(self, client: ScopeGateClient) -> None:
         self._client = client
 
+    def list(self) -> Any:
+        # Gateway exposes GET /v1/approvals (store-backed; results depend on runtime wiring).
+        return self._client.request("GET", self._client.endpoint("approvals"))
+
     def get(self, approval_id: str) -> ApprovalRequest:
-        raise ScopeGateNotImplementedError(
-            f"Approvals GET by id is not implemented by current gateway API (approval_id={approval_id!r}). "
-            "Use create/resolve via approvals endpoint payloads as supported."
+        resp = self._client.request("GET", f"{self._client.endpoint('approvals')}/{urllib.parse.quote(approval_id)}")
+        raw = resp if isinstance(resp, Mapping) else {"value": resp}
+        body = raw.get("body") if isinstance(raw, Mapping) else None
+        rec = body if isinstance(body, Mapping) else (dict(raw) if isinstance(raw, Mapping) else {})
+        status = str(rec.get("status", "unknown"))
+        return ApprovalRequest(
+            approval_id=str(rec.get("id", approval_id)),
+            status=status,
+            tool=rec.get("tool"),
+            reason=rec.get("reason"),
+            raw=dict(raw) if isinstance(raw, Mapping) else None,
         )
+
+    def create(self, payload: Mapping[str, Any]) -> Any:
+        return self._client.create_approval(payload)
 
     def resolve(self, approval_id: str, decision: str, reason: Optional[str] = None) -> ApprovalRequest:
         payload: Dict[str, Any] = {"id": approval_id, "action": decision, "decision": decision}
         if reason:
             payload["reason"] = reason
-        resp = self._client.request("POST", self._client.endpoint("approvals"), json_body=payload)
+        # Prefer path-based resolve endpoint; fall back to legacy/body-based POST /v1/approvals.
+        try:
+            resp = self._client.request(
+                "POST",
+                f"{self._client.endpoint('approvals')}/{urllib.parse.quote(approval_id)}/resolve",
+                json_body={k: v for k, v in {"action": decision, "decision": decision, "reason": reason}.items() if v is not None},
+            )
+        except ScopeGateHTTPError as e:
+            if e.status not in (404, 405, 501):
+                raise
+            resp = self._client.request("POST", self._client.endpoint("approvals"), json_body=payload)
         raw = resp if isinstance(resp, Mapping) else {"value": resp}
         body = raw.get("body") if isinstance(raw, Mapping) else None
         status = "resolved"
@@ -348,17 +427,18 @@ class _HttpAudit(AuditAPI):
 
     def query(self, query: Optional[AuditQuery] = None, **kwargs: Any) -> Any:
         q = query or AuditQuery(**kwargs)
-        params = {
+        body = {
             "task_id": q.task_id,
             "decision": q.decision,
             "limit": q.limit,
             "offset": q.offset,
-            "verify": "true" if q.verify else ("false" if q.verify is False else None),
+            "verify": q.verify,
         }
-        return self._client.request("GET", self._client.endpoint("audit"), params=params)
+        body = {k: v for k, v in body.items() if v is not None}
+        # Current gateway audit handler accepts JSON body (GET/POST); POST is widely compatible.
+        return self._client.request("POST", self._client.endpoint("audit"), json_body=body)
 
     def verify(self, scope: Optional[str] = None) -> Any:
-        params = {"verify": "true"}
-        if scope:
-            params["task_id"] = scope
-        return self.query(AuditQuery(task_id=scope, verify=True))
+        # Current gateway verifies store-backed chain via GET /v1/audit/verify (scope accepted for compatibility).
+        _ = scope
+        return self._client.request("GET", self._client.endpoint("audit_verify"))

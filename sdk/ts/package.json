@@ -15,10 +15,10 @@
   },
   "files": ["src", "README.md", "tsconfig.json"],
   "scripts": {
-    "build": "echo \"TODO: implement build (tsc) once runtime API stabilizes\"",
-    "typecheck": "echo \"TODO: tsc --noEmit (requires typescript devDependency/tooling)\"",
-    "test": "echo \"TODO: implement tests against runtime/gateway contract\"",
-    "lint": "echo \"TODO: implement lint\""
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('No automated tests configured for @scopegate/sdk')\"",
+    "lint": "node -e \"console.log('No lint configured for @scopegate/sdk')\""
   },
   "engines": {
     "node": ">=18"
