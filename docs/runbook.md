@@ -47,6 +47,26 @@
 - **Policies:** example policies under `policies/examples/` are illustrative only.
 - **Preflight (planned):** config/policy checks before rollout; pin policy versions and keep rollback artifact/version ready.
 
+### 2.5 Operator CLI (`scopegatectl`)
+
+A local client for a running gateway lives in `crates/cli/`. It links no gateway internals and can only change state through the documented approval-resolution endpoint.
+
+```bash
+cargo build -p scopegate-ctl
+./target/debug/scopegatectl status
+./target/debug/scopegatectl tasks
+./target/debug/scopegatectl approvals list --status pending
+./target/debug/scopegatectl approvals resolve <id> approve   # or deny / timeout
+./target/debug/scopegatectl audit list --limit 10
+./target/debug/scopegatectl audit verify
+./target/debug/scopegatectl policies
+./target/debug/scopegatectl tui
+```
+
+Options: `--url` / `SCOPEGATE_URL` (default `http://127.0.0.1:8080`) and `--token` / `SCOPEGATE_TOKEN`. The TUI is a btop/abtop-style dashboard with readiness/audit-chain gauges and traffic sparklines from `/metrics` (raw Prometheus text); keys: `Tab`/`←→` views, `j`/`k`/`↑↓` select, `r` refresh, `a`/`d`/`x` resolve, `t` theme, `q` quit. It requires an interactive terminal; one-shot commands do not.
+
+**Ops caveat:** CLI output is a live read of preview surfaces. It is not validation, enforce-mode evidence, or a sign-off artifact. A failing `audit verify` should be handled as a fail-closed integrity signal, not silently retried away.
+
 ## 3. Health, readiness, and rollback notes (partial)
 
 | Endpoint | Purpose | Current behavior (factual) | Ops note |
