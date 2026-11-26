@@ -187,11 +187,12 @@ impl App {
             self.message = "no approval selected".to_string();
             return;
         };
-        self.message = match self.client.resolve(&id, decision) {
+        let result = match self.client.resolve(&id, decision) {
             Ok(view) => format!("{id} -> {}", view.status),
             Err(e) => format!("resolve failed: {e}"),
         };
         self.refresh();
+        self.message = result;
     }
 
     fn event_loop(
@@ -776,9 +777,9 @@ pub fn run(client: Client) -> Result<(), String> {
         );
     }
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
+    let _guard = TerminalGuard;
     execute!(stdout(), EnterAlternateScreen)
         .map_err(|e| format!("cannot enter alternate screen: {e}"))?;
-    let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal =
         Terminal::new(backend).map_err(|e| format!("cannot create terminal: {e}"))?;

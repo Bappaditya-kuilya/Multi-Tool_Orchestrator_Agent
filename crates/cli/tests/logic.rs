@@ -1,7 +1,7 @@
 //! Small, network-free tests for the client's pure logic.
 //! These are written before the implementation (RED).
 
-use scopegate_ctl::client::{join_url, metrics_from_text, resolve_action_to_decision};
+use scopegate_ctl::client::{encode, join_url, metrics_from_text, resolve_action_to_decision};
 use scopegate_ctl::model::Envelope;
 
 #[test]
@@ -22,6 +22,13 @@ fn resolve_action_maps_human_words_to_api_decisions() {
     assert_eq!(resolve_action_to_decision("deny"), Some("deny"));
     assert_eq!(resolve_action_to_decision("timeout"), Some("timeout"));
     assert_eq!(resolve_action_to_decision("nonsense"), None);
+}
+
+#[test]
+fn encode_prevents_query_and_path_injection() {
+    assert_eq!(encode("pending&limit=999"), "pending%26limit%3D999");
+    assert_eq!(encode("a/b?c"), "a%2Fb%3Fc");
+    assert_eq!(encode("ap-1"), "ap-1");
 }
 
 #[test]

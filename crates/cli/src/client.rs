@@ -17,6 +17,19 @@ pub fn join_url(base: &str, path: &str) -> String {
     format!("{base}/{path}")
 }
 
+/// Percent-encode one query/path value so user input cannot add parameters or path segments.
+pub fn encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// Map a human word to the `decision` value accepted by `/v1/approvals/:id/resolve`.
 pub fn resolve_action_to_decision(action: &str) -> Option<&'static str> {
     match action.to_ascii_lowercase().as_str() {
@@ -39,7 +52,8 @@ impl Client {
         let config = ureq::Agent::config_builder()
             // Read 4xx/5xx bodies so we can surface the gateway's fail-closed error.
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(5)))
+            // Short timeout: the TUI makes seven sequential calls per refresh.
+            .timeout_global(Some(Duration::from_secs(2)))
             .build();
         Self {
             agent: config.into(),
@@ -118,7 +132,7 @@ impl Client {
 
     pub fn approvals(&self, status: Option<&str>) -> Result<Vec<ApprovalRecordView>, String> {
         let path = match status {
-            Some(s) if !s.trim().is_empty() => format!("/v1/approvals?status={s}"),
+            Some(s) if !s.trim().is_empty() => format!("/v1/approvals?status={}", encode(s)),
             _ => "/v1/approvals".to_string(),
         };
         self.get_envelope::<ApprovalListView>(&path)?
@@ -129,7 +143,7 @@ impl Client {
     pub fn resolve(&self, id: &str, decision: &str) -> Result<ApprovalView, String> {
         let decision = resolve_action_to_decision(decision)
             .ok_or_else(|| format!("unknown decision: {decision}"))?;
-        let path = format!("/v1/approvals/{id}/resolve");
+        let path = format!("/v1/approvals/{}/resolve", encode(id));
         self.post_envelope(&path, &serde_json::json!({ "decision": decision }))?
             .into_result()
     }

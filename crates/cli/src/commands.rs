@@ -5,7 +5,10 @@ use crate::client::Client;
 pub fn status(client: &Client) -> Result<(), String> {
     let health = client.health()?;
     let ready = client.ready()?;
-    let metrics = client.metrics().unwrap_or_default();
+    let metrics = match client.metrics() {
+        Ok(m) => format!("{} bytes ({})", m.body.len(), m.format),
+        Err(e) => format!("unavailable ({e})"),
+    };
 
     println!("endpoint : {}", client.endpoint());
     println!("health   : {}", health.status);
@@ -14,11 +17,7 @@ pub fn status(client: &Client) -> Result<(), String> {
         if ready.ready { "yes" } else { "no" },
         ready.reason.map(|r| format!(" ({r})")).unwrap_or_default()
     );
-    println!(
-        "metrics  : {} bytes ({})",
-        metrics.body.len(),
-        metrics.format
-    );
+    println!("metrics  : {metrics}");
 
     if !ready.ready {
         return Err("gateway is not ready".to_string());
