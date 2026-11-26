@@ -32,11 +32,20 @@ Start a local gateway first, for example `./scripts/run_sqlite_demo.sh`.
 Global flags: `--url` (`SCOPEGATE_URL`, default `http://127.0.0.1:8080`) and
 `--token` (`SCOPEGATE_TOKEN`).
 
-## TUI keys
+## TUI
 
-`Tab` / `←` `→` switch tabs; `↑` `↓` select a row; `r` refresh (also auto-refreshes
-every 2s); on the Approvals tab `a` approves, `d` denies, `x` times out the
-selected approval; `q` or `Esc` quits.
+A btop/abtop-style full-screen dashboard: live header with connection state and
+clock, readiness and audit-chain gauges, traffic sparklines fed by the gateway's
+Prometheus counters, colour-coded tables, a keybinding strip, and a message ticker.
+
+Keys:
+
+- `Tab` / `←` `→` — switch tabs
+- `j` `k` / `↑` `↓` — select a row
+- `r` — manual refresh (also auto-refreshes every 2s)
+- `a` / `d` / `x` — approve / deny / timeout the selected approval
+- `t` — cycle themes (`btop`, `amber`, `mono`)
+- `q` or `Esc` — quit
 
 ## Notes
 

@@ -6,5 +6,6 @@
 
 pub mod client;
 pub mod commands;
+pub mod metrics;
 pub mod model;
 pub mod tui;

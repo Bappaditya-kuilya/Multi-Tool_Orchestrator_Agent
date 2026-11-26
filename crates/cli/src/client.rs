@@ -97,8 +97,17 @@ impl Client {
         self.get_envelope("/readyz")?.into_result()
     }
 
+    /// `/metrics` is the one route that returns raw Prometheus text, not an
+    /// `ApiResponse<T>` envelope (`crates/gateway/src/server.rs:135`).
     pub fn metrics(&self) -> Result<Metrics, String> {
-        self.get_envelope("/metrics")?.into_result()
+        let request = self.with_auth(self.agent.get(join_url(&self.base, "/metrics")));
+        let mut response = request.call().map_err(|e| format!("request failed: {e}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("failed to read response body: {e}"))?;
+        metrics_from_text(status, body)
     }
 
     pub fn tasks(&self) -> Result<Vec<TaskRecordView>, String> {
@@ -137,6 +146,17 @@ impl Client {
     pub fn policy(&self) -> Result<PolicyView, String> {
         self.get_envelope("/v1/policies")?.into_result()
     }
+}
+
+/// Keep the raw Prometheus body; only reject non-success HTTP statuses.
+pub fn metrics_from_text(status: u16, body: String) -> Result<Metrics, String> {
+    if status >= 400 {
+        return Err(format!("metrics unavailable (HTTP {status})"));
+    }
+    Ok(Metrics {
+        format: "text/plain; version=0.0.4".to_string(),
+        body,
+    })
 }
 
 fn parse_envelope<T: DeserializeOwned>(body: &str, status: u16) -> Result<Envelope<T>, String> {

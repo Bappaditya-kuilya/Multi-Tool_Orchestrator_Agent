@@ -1,7 +1,7 @@
 //! Small, network-free tests for the client's pure logic.
 //! These are written before the implementation (RED).
 
-use scopegate_ctl::client::{join_url, resolve_action_to_decision};
+use scopegate_ctl::client::{join_url, metrics_from_text, resolve_action_to_decision};
 use scopegate_ctl::model::Envelope;
 
 #[test]
@@ -22,6 +22,20 @@ fn resolve_action_maps_human_words_to_api_decisions() {
     assert_eq!(resolve_action_to_decision("deny"), Some("deny"));
     assert_eq!(resolve_action_to_decision("timeout"), Some("timeout"));
     assert_eq!(resolve_action_to_decision("nonsense"), None);
+}
+
+#[test]
+fn metrics_keeps_raw_prometheus_text() {
+    let text = "# HELP gateway_requests_total Total\ngateway_requests_total 42\n";
+    let m = metrics_from_text(200, text.to_string()).expect("200 metrics");
+    assert_eq!(m.body, text);
+    assert_eq!(m.format, "text/plain; version=0.0.4");
+}
+
+#[test]
+fn metrics_rejects_error_status() {
+    let err = metrics_from_text(503, "unavailable".to_string()).expect_err("503 metrics");
+    assert!(err.contains("503"), "{err}");
 }
 
 #[test]
