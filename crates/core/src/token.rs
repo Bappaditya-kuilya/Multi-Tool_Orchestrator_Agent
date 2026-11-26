@@ -1215,6 +1215,7 @@ pub mod biscuit_adapter {
                     Err(e) => return Err(e),
                 }
             }
+            let _ = saw_key;
             Err(TokenError::Revoked)
         }
 

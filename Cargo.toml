@@ -7,6 +7,7 @@ members = [
   "crates/mcp-pool",
   "crates/broker",
   "crates/store",
+  "crates/cli",
 ]
 
 [workspace.package]

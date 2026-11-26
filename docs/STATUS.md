@@ -10,6 +10,7 @@
 - **Bench (`bench/` pytest harness):** **38 passed, 7 xfailed** unconfigured; configured clean-gateway local sqlite+stdio capture **45 passed, 0 xfailed** (`e2e/logs/phase3a-t6-live-bench-20261121T170500Z/`, clean gateway/data dir, commit `30bdcfc`, evidence only — not enforce-mode sign-off). 4 capability + 3 live-gateway integration tests pass when configured but remain env-gated in unconfigured runs.
 - **Dashboard build:** pass (`cd dashboard && npm run build`)
 - **SDK checks:** pass — Python `py_compile` (`sdk/python/src/scopegate_sdk/__init__.py`), TypeScript `tsc -p tsconfig.json --noEmit` (`sdk/ts`)
+- **Operator CLI (2026-11-26):** `crates/cli` adds `scopegatectl` (one-shot commands + ratatui TUI over the v1 API); `cargo test -p scopegate-ctl` 13 passed, fmt/clippy green, live smoke against the sqlite demo gateway passed. Client only; preview tooling, not a sign-off surface.
 
 ## Captured S1 proof artifacts
 

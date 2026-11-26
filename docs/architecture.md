@@ -10,7 +10,7 @@
 
 ## 1.1 Current scaffold / implementation state (factual)
 
-- **Rust workspace:** `crates/core`, `crates/gateway`, `crates/mcp-front`, `crates/mcp-pool`, `crates/broker`, `crates/store`.
+- **Rust workspace:** `crates/core`, `crates/gateway`, `crates/mcp-front`, `crates/mcp-pool`, `crates/broker`, `crates/store`, `crates/cli` (operator client).
 - **`core` primitives (implemented, non-production substitutes):** token scope attenuation (`child ⊆ parent`), expiry/budget narrowing, revocation-ID placeholder checks; policy `Permit/Forbid/RequireApproval` with deny-by-default and `Forbid` overrides; FNV-1a (non-cryptographic) hash-chained audit append/verify; coarse/session-level taint decisions. Unit tests exist.
 - **Gateway runtime (partial):** axum-based HTTP server and binary wiring exist (`crates/gateway/src/main.rs`, `server.rs`, `api.rs`, `mcp.rs`, `state.rs`). Config loading supports store wiring: in-memory by default, with optional SQLite (WAL/sqlx) store selection/init/connect/migrate via config/env and fail-closed handling on durable-store init/connect/migrate errors. Exposed routes include `/healthz`, `/readyz`, `/metrics`, `/v1/tasks` (GET/POST), `/v1/tasks/:id` (GET), `/v1/tasks/:id/revoke` (POST), `/v1/audit` (GET/POST), `/v1/audit/verify` (GET), `/v1/approvals` (GET/POST), `/v1/approvals/:id` (GET), `/v1/approvals/:id/resolve` (POST), `/v1/policies` (GET/POST), `/v1/stream` (SSE), `/mcp` (POST JSON-RPC dispatch wrapper; non-POST returns fail-closed).
 - **Gateway API/MCP behavior (as implemented):** task create/list/get/revoke and policy/approval/audit query handlers are wired to store-backed paths where available; `GET /v1/audit/verify` performs store-backed hash-chain verification and can fail closed on unavailable store/invalid chain per config. MCP dispatch is minimal (`initialize`, `ping`, `tools/list`, local `gateway.health` tool, and pool-forwarding abstractions when configured) with policy/approval/audit checks in the MCP path; it is **not** a full `rmcp` runtime or complete upstream MCP execution/proxy.
@@ -42,6 +42,28 @@
                                        Dashboard (React) · CLI · OTel/Prometheus
 ```
 
+The same target flow as a Mermaid diagram (renders on GitHub):
+
+```mermaid
+flowchart LR
+    A["Agent / MCP client"] --> F["MCP Server Front"]
+    F --> T["AuthN (Biscuit)"]
+    T --> P["Policy (Cedar)"]
+    P --> Taint["Taint check"]
+    Taint -->|allow| BR["Credential Broker"]
+    Taint -->|require approval| AP["Approval Service (pause/resume)"]
+    AP -->|approved| BR
+    BR --> Pool["MCP Client Pool"]
+    Pool --> UP["Upstream MCP tools"]
+    F --> Aud["Audit Writer (hash chain)"]
+    Pool --> Aud
+    AP --> ST[("Store: SQLite to Postgres")]
+    T --> ST
+    Aud --> ST
+    ST --> API["Admin API"]
+    API --> UI["Dashboard / CLI / SDKs / Ops"]
+```
+
 ## 3. Components (target) and scaffold mapping
 
 | Target component | Responsibility (target) | Current state |
@@ -57,6 +79,7 @@
 | **Store** | Persist upstreams, policies, tasks, approvals, audit log | Trait + in-memory + SQLite (sqlx/WAL) adapter/migration tracking-idempotency progress + Postgres scaffolding. Gateway supports optional SQLite wiring/config; production durability/restart-safe guarantees unproven end-to-end. |
 | **Events** | Approval/SSE/live propagation | `/v1/stream` SSE and internal event plumbing exist in gateway; durability/cross-node semantics not implemented. |
 | **Admin/API surfaces** | Task/policy/approval/audit management | Task create/list/get/revoke, audit query/verify, approvals, and policies endpoints are exposed in gateway; contracts/behavior may evolve. |
+| **Operator CLI / TUI** | Local inspection and approval resolution | `crates/cli` provides `scopegatectl` one-shot commands and a btop/abtop-style ratatui dashboard over the v1 API; **client only**, links no gateway internals and cannot bypass a fail-closed check. |
 | **Dashboard** | Timeline, policies, approvals, token/task views, audit, benchmark | Vite+React+TS scaffold with typed API client/SSE integration points (build verified; no live backend E2E verification). |
 | **Ops surfaces** | Health/readiness/metrics/tracing | `/healthz,/readyz,/metrics` implemented (readiness/store checks in current wiring). Tracing/OTel and production observability incomplete. |
 
@@ -140,7 +163,7 @@
 
 ## 8. Repository layout (current)
 
-- `crates/{core,gateway,mcp-front,mcp-pool,broker,store}` — Rust workspace crates (primitives/runtime scaffolding and partial integrations)
+- `crates/{core,gateway,mcp-front,mcp-pool,broker,store,cli}` — Rust workspace crates (primitives/runtime scaffolding, partial integrations, and the `scopegatectl` client)
 - `docs/` — PRD, architecture, threat model, runbook, STATUS, ADRs, migration map
 - `policies/examples/`, `scopegate.toml.example` — config/policy examples/scaffolds
 - `bench/` — Python pytest attack/behavior harness
@@ -149,6 +172,26 @@
 - `docker/`, `scripts/`, `e2e/` — compose/build/run/check/demo scaffolds and SQLite-oriented dev conveniences
 - `.github/workflows/` — CI workflows
 - `reference/`, `graphify-out/`, `REPO_GRAPH.md` — legacy/reference/migration artifacts
+
+## 8.1 Operator CLI (`scopegatectl`)
+
+`crates/cli` is a thin client over the documented v1 HTTP API. It deliberately links no gateway internals, so it cannot bypass a fail-closed check. Its only mutating operation is approval resolution via `POST /v1/approvals/:id/resolve`.
+
+```mermaid
+flowchart LR
+    C["scopegatectl<br/>CLI / TUI"] --> G["gateway v1 API"]
+    G --> H["/healthz /readyz /metrics"]
+    G --> T["/v1/tasks"]
+    G --> A["/v1/approvals<br/>list + resolve"]
+    G --> L["/v1/audit<br/>list + verify"]
+    G --> P["/v1/policies"]
+    C -. "Prometheus text" .-> M["traffic sparklines<br/>in the TUI"]
+    H -.-> M
+```
+
+One-shot commands: `status`, `tasks`, `approvals list|resolve`, `audit list|verify`, `policies`. The TUI adds a live header, readiness/audit-chain gauges, colour-coded tables, themes (`btop`, `amber`, `mono`) and Vim-style `j/k` navigation. See [`crates/cli/README.md`](../crates/cli/README.md) for the full command and key reference.
+
+The CLI is preview tooling against a preview gateway: it is **not** an enforcement surface and produces **no security or sign-off evidence**.
 
 ## 9. Open decisions / remaining gaps
 
